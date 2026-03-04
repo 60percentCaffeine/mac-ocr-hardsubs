@@ -1,0 +1,13 @@
+[tool.poetry]
+name = "ocranime"
+version = "0.1.0"
+description = "Extract burned-in subtitles from anime videos using macOS Vision OCR"
+authors = []
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pyobjc-framework-Vision = ">=10.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

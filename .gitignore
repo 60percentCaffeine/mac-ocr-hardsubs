@@ -3,3 +3,4 @@ test.srt
 test.raw.srt
 .env
 __pycache__
+scanned_frames/

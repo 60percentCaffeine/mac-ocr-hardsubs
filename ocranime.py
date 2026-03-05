@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -296,7 +297,7 @@ def main():
                         help="OCR languages (default: zh-Hant)")
     parser.add_argument("--fast", action="store_true",
                         help="Use fast OCR mode instead of accurate")
-    parser.add_argument("--cleanup-backend", required=True,
+    parser.add_argument("--cleanup-backend", default=None,
                         choices=["none", "ollama", "openrouter"],
                         help="LLM backend for OCR cleanup (none to skip)")
     parser.add_argument("--cleanup-model", default=None,
@@ -304,10 +305,31 @@ def main():
                              "qwen/qwen3-235b-a22b-2507 for openrouter)")
     parser.add_argument("--cleanup-reasoning", type=int, choices=[0, 1], default=None,
                         help="Enable (1) or disable (0) thinking/reasoning for cleanup model")
+    parser.add_argument("--scan-only", action="store_true",
+                        help="Only generate subtitle frame PNGs in scanned_frames/, skip SRT generation")
     args = parser.parse_args()
 
-    if args.cleanup_backend != "none" and args.cleanup_reasoning is None:
-        parser.error("--cleanup-reasoning is required when --cleanup-backend is not 'none'")
+    scan_only_incompatible = []
+    if args.scan_only:
+        if args.output is not None:
+            scan_only_incompatible.append("--output")
+        if args.languages != ["zh-Hant"]:
+            scan_only_incompatible.append("--languages")
+        if args.fast:
+            scan_only_incompatible.append("--fast")
+        if args.cleanup_backend is not None:
+            scan_only_incompatible.append("--cleanup-backend")
+        if args.cleanup_model is not None:
+            scan_only_incompatible.append("--cleanup-model")
+        if args.cleanup_reasoning is not None:
+            scan_only_incompatible.append("--cleanup-reasoning")
+        if scan_only_incompatible:
+            parser.error(f"--scan-only is incompatible with: {', '.join(scan_only_incompatible)}")
+    else:
+        if args.cleanup_backend is None:
+            parser.error("--cleanup-backend is required when not using --scan-only")
+        if args.cleanup_backend != "none" and args.cleanup_reasoning is None:
+            parser.error("--cleanup-reasoning is required when --cleanup-backend is not 'none'")
 
     video_path = args.video
     if not os.path.isfile(video_path):
@@ -316,10 +338,30 @@ def main():
 
     output_path = args.output or (os.path.splitext(video_path)[0] + ".srt")
 
+    # Prepare scanned_frames directory (empty it on each run)
+    scanned_dir = Path("scanned_frames")
+    if scanned_dir.exists():
+        shutil.rmtree(scanned_dir)
+    scanned_dir.mkdir()
+
     with tempfile.TemporaryDirectory(prefix="ocranime_") as tmpdir:
         print(f"Extracting frames (interval={args.interval}s)...")
         frames = extract_frames(video_path, tmpdir, args.interval, args.crop)
         print(f"Extracted {len(frames)} frames")
+
+        # Copy frames to scanned_frames with timestamp names
+        for idx, frame in enumerate(frames):
+            timestamp = idx * args.interval
+            h = int(timestamp // 3600)
+            m = int((timestamp % 3600) // 60)
+            s = int(timestamp % 60)
+            dest = scanned_dir / f"{h:02d}-{m:02d}-{s:02d}.png"
+            shutil.copy2(frame, dest)
+        print(f"Saved {len(frames)} frame PNGs to {scanned_dir}/")
+
+        if args.scan_only:
+            print("Scan-only mode: skipping OCR and SRT generation.")
+            return
 
         raw_entries = []
         for idx, frame in enumerate(frames):

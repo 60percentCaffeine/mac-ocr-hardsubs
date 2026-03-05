@@ -242,7 +242,7 @@ def call_openrouter(messages, model="qwen/qwen3-235b-a22b-2507", temperature=0.3
     return strip_thinking("".join(content_parts))
 
 
-def call_claude(messages, model="claude-sonnet-4-6", temperature=0.3):
+def call_claude(messages, model="claude-sonnet-4-6", temperature=0.3, thinking=True):
     """Call Claude via Claude Code headless mode. Returns assistant content."""
     # Build the prompt: system prompt + user message
     system_prompt = ""
@@ -257,6 +257,11 @@ def call_claude(messages, model="claude-sonnet-4-6", temperature=0.3):
     if system_prompt:
         cmd.extend(["--system-prompt", system_prompt])
 
+    env = None
+    if not thinking:
+        env = os.environ.copy()
+        env["MAX_THINKING_TOKENS"] = "0"
+
     try:
         result = subprocess.run(
             cmd,
@@ -264,6 +269,7 @@ def call_claude(messages, model="claude-sonnet-4-6", temperature=0.3):
             capture_output=True,
             text=True,
             timeout=300,
+            env=env,
         )
     except FileNotFoundError:
         print(
@@ -279,7 +285,7 @@ def call_claude(messages, model="claude-sonnet-4-6", temperature=0.3):
         print(result.stderr, file=sys.stderr)
         sys.exit(1)
 
-    return strip_thinking(result.stdout.strip())
+    return result.stdout.strip()
 
 
 def parse_cleanup_response(response_text, batch_entries):
@@ -342,7 +348,9 @@ def cleanup_with_llm(
     if backend == "openrouter":
         call_llm_fn = call_openrouter
     elif backend == "claude":
-        call_llm_fn = call_claude
+        call_llm_fn = lambda msgs, model, temperature: call_claude(
+            msgs, model=model, temperature=temperature, thinking=thinking
+        )
     else:
         call_llm_fn = call_ollama
 
@@ -359,7 +367,7 @@ def cleanup_with_llm(
             # Replace newlines with ' | ' so multi-line entries are unambiguous
             user_lines.append(f"[{i}] {text.replace(chr(10), ' | ')}")
         user_prompt = "\n".join(user_lines)
-        if not thinking:
+        if not thinking and backend != "claude":
             user_prompt += " /no_think"
 
         messages = [

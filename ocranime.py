@@ -126,7 +126,7 @@ def call_ollama(messages, model="qwen3:8b-q4_K_M", temperature=0.3):
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
         print(f"Error: cannot connect to Ollama at {url}: {e}", file=sys.stderr)
         print("Make sure Ollama is running (ollama serve) and the model is pulled.", file=sys.stderr)
-        print("Use --no-cleanup to skip LLM cleanup.", file=sys.stderr)
+        print("Use --cleanup-backend=none to skip LLM cleanup.", file=sys.stderr)
         sys.exit(1)
     content_parts = []
     try:
@@ -204,30 +204,6 @@ def parse_cleanup_response(response_text, batch_entries):
             continue
         if i in keeps:
             cleaned = keeps[i]
-            # Guard against hallucination: if edit distance is too high relative
-            # to text length, the LLM likely rewrote rather than fixed the text.
-            # Drop the entry instead of keeping the hallucinated version.
-            original_flat = text.replace("\n", " | ")
-            # If cleaned text is a subset of the original lines (e.g. stripping
-            # non-dialogue lines from a multi-line entry), that's legitimate.
-            original_lines = set(text.split("\n"))
-            cleaned_lines_list = cleaned.split(" | ") if " | " in cleaned else [cleaned]
-            is_line_subset = set(cleaned_lines_list).issubset(original_lines)
-            if not is_line_subset:
-                # Per-line hallucination check: for each cleaned line, find its
-                # best-matching original line. If any line is too different, fall
-                # back to original text (the LLM likely rewrote it).
-                orig_lines_list = text.split("\n")
-                hallucinated = False
-                for cl in cleaned_lines_list:
-                    best_dist = min(_edit_distance(ol, cl) for ol in orig_lines_list)
-                    line_threshold = max(4, len(cl) // 3)
-                    if best_dist > line_threshold:
-                        hallucinated = True
-                        break
-                if hallucinated:
-                    result.append((text, start, end))  # Fall back to original
-                    continue
             result.append((cleaned, start, end))
         else:
             # Not mentioned — keep unchanged (safe fallback)
@@ -320,16 +296,18 @@ def main():
                         help="OCR languages (default: zh-Hant)")
     parser.add_argument("--fast", action="store_true",
                         help="Use fast OCR mode instead of accurate")
-    parser.add_argument("--no-cleanup", action="store_true",
-                        help="Disable LLM-based OCR artifact cleanup")
+    parser.add_argument("--cleanup-backend", required=True,
+                        choices=["none", "ollama", "openrouter"],
+                        help="LLM backend for OCR cleanup (none to skip)")
     parser.add_argument("--cleanup-model", default=None,
                         help="Model for cleanup (default: qwen3:8b-q4_K_M for ollama, "
                              "qwen/qwen3-235b-a22b-2507 for openrouter)")
-    parser.add_argument("--no-thinking", action="store_true",
-                        help="Disable thinking/reasoning for cleanup model (faster, less accurate)")
-    parser.add_argument("--openrouter", action="store_true",
-                        help="Use OpenRouter API instead of Ollama for cleanup")
+    parser.add_argument("--cleanup-reasoning", type=int, choices=[0, 1], default=None,
+                        help="Enable (1) or disable (0) thinking/reasoning for cleanup model")
     args = parser.parse_args()
+
+    if args.cleanup_backend != "none" and args.cleanup_reasoning is None:
+        parser.error("--cleanup-reasoning is required when --cleanup-backend is not 'none'")
 
     video_path = args.video
     if not os.path.isfile(video_path):
@@ -354,19 +332,20 @@ def main():
         print()
 
         entries = deduplicate(raw_entries)
-        if not args.no_cleanup:
+        if args.cleanup_backend != "none":
             # Save raw (pre-cleanup) SRT alongside the final one
             raw_path = os.path.splitext(output_path)[0] + ".raw.srt"
             write_srt(entries, raw_path)
             print(f"Written {len(entries)} raw subtitle entries to {raw_path}")
 
-            backend = "openrouter" if args.openrouter else "ollama"
-            default_model = ("qwen/qwen3-235b-a22b-2507" if args.openrouter
+            backend = args.cleanup_backend
+            default_model = ("qwen/qwen3-235b-a22b-2507" if backend == "openrouter"
                              else "qwen3:8b-q4_K_M")
             cleanup_model = args.cleanup_model or default_model
+            thinking = bool(args.cleanup_reasoning)
             print(f"Cleaning up OCR artifacts with {cleanup_model} ({backend})...")
             entries = cleanup_with_llm(entries, model=cleanup_model, languages=args.languages,
-                                     thinking=not args.no_thinking, backend=backend)
+                                     thinking=thinking, backend=backend)
             # Fuzzy dedup: merge consecutive near-duplicate entries the LLM missed
             entries = deduplicate(entries, max_dist=2)
         write_srt(entries, output_path)

@@ -88,9 +88,9 @@ poetry run python ocranime.py video.mp4 --cleanup-backend=none
 | `--cleanup-backend` | LLM backend: `none`, `ollama`, `openrouter` | required |
 | `--cleanup-model` | Model for cleanup | auto per backend |
 | `--cleanup-reasoning` | Enable (1) or disable (0) thinking | required if backend != none |
+| `--scan-only` | Only detect subtitle frames, skip OCR/SRT | off |
 
 > **Reasoning tips:** Reasoning (`--cleanup-reasoning=1`) is recommended with Claude and the default OpenRouter model for best cleanup quality. For Ollama, reasoning is **not recommended** — it makes inference very slow with local models.
-| `--scan-only` | Only detect subtitle frames, skip OCR/SRT | off |
 
 ### Examples
 

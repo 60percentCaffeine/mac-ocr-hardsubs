@@ -17,6 +17,7 @@ import Vision
 from Foundation import NSData
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 
@@ -27,9 +28,13 @@ def extract_frames(video_path, tmpdir, crop, fps):
     """Extract cropped frames from video using ffmpeg at given fps."""
     output_pattern = os.path.join(tmpdir, "%06d.png")
     cmd = [
-        "ffmpeg", "-i", video_path,
-        "-vf", f"crop={crop},fps={fps}",
-        "-loglevel", "error",
+        "ffmpeg",
+        "-i",
+        video_path,
+        "-vf",
+        f"crop={crop},fps={fps}",
+        "-loglevel",
+        "error",
         output_pattern,
     ]
     subprocess.run(cmd, check=True)
@@ -134,7 +139,9 @@ def deduplicate(entries, max_dist=0):
     current_text, current_start, current_end = entries[0]
 
     for text, start, end in entries[1:]:
-        if text == current_text or (max_dist > 0 and _edit_distance(text, current_text) <= max_dist):
+        if text == current_text or (
+            max_dist > 0 and _edit_distance(text, current_text) <= max_dist
+        ):
             current_end = end
         else:
             merged.append((current_text, current_start, current_end))
@@ -167,7 +174,10 @@ def call_ollama(messages, model="qwen3:8b-q4_K_M", temperature=0.3):
         resp = urllib.request.urlopen(req, timeout=300)
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
         print(f"Error: cannot connect to Ollama at {url}: {e}", file=sys.stderr)
-        print("Make sure Ollama is running (ollama serve) and the model is pulled.", file=sys.stderr)
+        print(
+            "Make sure Ollama is running (ollama serve) and the model is pulled.",
+            file=sys.stderr,
+        )
         print("Use --cleanup-backend=none to skip LLM cleanup.", file=sys.stderr)
         sys.exit(1)
     content_parts = []
@@ -186,7 +196,10 @@ def call_openrouter(messages, model="qwen/qwen3-235b-a22b-2507", temperature=0.3
     """Call OpenRouter chat API with streaming. Returns assistant content."""
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        print("Error: OPENROUTER_API_KEY not set. Add it to .env or environment.", file=sys.stderr)
+        print(
+            "Error: OPENROUTER_API_KEY not set. Add it to .env or environment.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     url = "https://openrouter.ai/api/v1/chat/completions"
@@ -229,12 +242,55 @@ def call_openrouter(messages, model="qwen/qwen3-235b-a22b-2507", temperature=0.3
     return strip_thinking("".join(content_parts))
 
 
+def call_claude(messages, model="claude-sonnet-4-6", temperature=0.3):
+    """Call Claude via Claude Code headless mode. Returns assistant content."""
+    # Build the prompt: system prompt + user message
+    system_prompt = ""
+    user_prompt = ""
+    for msg in messages:
+        if msg["role"] == "system":
+            system_prompt = msg["content"]
+        elif msg["role"] == "user":
+            user_prompt = msg["content"]
+
+    cmd = ["claude", "-p", "--model", model, "--output-format", "text"]
+    if system_prompt:
+        cmd.extend(["--system-prompt", system_prompt])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=user_prompt,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        print(
+            "Error: 'claude' CLI not found. Install Claude Code first.", file=sys.stderr
+        )
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("Error: Claude CLI timed out after 300s.", file=sys.stderr)
+        sys.exit(1)
+
+    if result.returncode != 0:
+        print(f"Error: Claude CLI failed (exit {result.returncode}):", file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+
+    return strip_thinking(result.stdout.strip())
+
+
 def parse_cleanup_response(response_text, batch_entries):
     """Parse KEEP/REMOVE lines from LLM response. Returns filtered entries."""
     keep_pattern = re.compile(r"^KEEP\s+(\d+)\s*:\s*(.+)$", re.MULTILINE)
     remove_pattern = re.compile(r"^REMOVE\s+(\d+)\s*$", re.MULTILINE)
 
-    keeps = {int(m.group(1)): m.group(2).strip().replace(" | ", "\n") for m in keep_pattern.finditer(response_text)}
+    keeps = {
+        int(m.group(1)): m.group(2).strip().replace(" | ", "\n")
+        for m in keep_pattern.finditer(response_text)
+    }
     removes = {int(m.group(1)) for m in remove_pattern.finditer(response_text)}
 
     if not keeps and not removes:
@@ -253,8 +309,14 @@ def parse_cleanup_response(response_text, batch_entries):
     return result
 
 
-def cleanup_with_llm(entries, model="qwen3:8b-q4_K_M", batch_size=30, languages=None, thinking=True,
-                     backend="ollama"):
+def cleanup_with_llm(
+    entries,
+    model="qwen3:8b-q4_K_M",
+    batch_size=30,
+    languages=None,
+    thinking=True,
+    backend="ollama",
+):
     """Clean OCR artifacts using LLM. Returns filtered entries."""
     if not entries:
         return entries
@@ -272,17 +334,24 @@ def cleanup_with_llm(entries, model="qwen3:8b-q4_K_M", batch_size=30, languages=
     lang_desc = ", ".join(lang_names.get(l, l) for l in languages)
 
     prompt_path = Path(__file__).parent / "cleanup-prompt.md"
-    system_prompt = prompt_path.read_text(encoding="utf-8").strip().format(lang_desc=lang_desc)
+    system_prompt = (
+        prompt_path.read_text(encoding="utf-8").strip().format(lang_desc=lang_desc)
+    )
 
     temperature = 0.2
-    call_llm_fn = call_openrouter if backend == "openrouter" else call_ollama
+    if backend == "openrouter":
+        call_llm_fn = call_openrouter
+    elif backend == "claude":
+        call_llm_fn = call_claude
+    else:
+        call_llm_fn = call_ollama
 
     all_results = []
     total_batches = (len(entries) + batch_size - 1) // batch_size
 
     for batch_idx in range(total_batches):
         start = batch_idx * batch_size
-        batch = entries[start:start + batch_size]
+        batch = entries[start : start + batch_size]
         print(f"  Batch {batch_idx + 1}/{total_batches}...", flush=True)
 
         user_lines = []
@@ -303,12 +372,17 @@ def cleanup_with_llm(entries, model="qwen3:8b-q4_K_M", batch_size=30, languages=
 
         if result is None:
             # Retry once
-            print(f"  Batch {batch_idx + 1}: response unparseable, retrying...", flush=True)
+            print(
+                f"  Batch {batch_idx + 1}: response unparseable, retrying...",
+                flush=True,
+            )
             response = call_llm_fn(messages, model=model, temperature=temperature)
             result = parse_cleanup_response(response, batch)
             if result is None:
-                print(f"Error: LLM response for batch {batch_idx + 1} is unparseable after retry.",
-                      file=sys.stderr)
+                print(
+                    f"Error: LLM response for batch {batch_idx + 1} is unparseable after retry.",
+                    file=sys.stderr,
+                )
                 print(f"Response was:\n{response}", file=sys.stderr)
                 sys.exit(1)
 
@@ -367,25 +441,50 @@ def write_srt(entries, output_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract hardsubs from anime video to SRT")
+    parser = argparse.ArgumentParser(
+        description="Extract hardsubs from anime video to SRT"
+    )
     parser.add_argument("video", help="Input video file path")
     parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt)")
-    parser.add_argument("--crop", default="iw*0.7:ih*0.15:iw*0.15:ih*0.8",
-                        help="ffmpeg crop filter (default: iw*0.7:ih*0.15:iw*0.15:ih*0.8)")
-    parser.add_argument("--fps", type=int, default=4,
-                        help="Frames per second to sample (default: 4)")
-    parser.add_argument("--languages", nargs="+", default=["zh-Hant"],
-                        help="OCR languages (default: zh-Hant)")
-    parser.add_argument("--cleanup-backend", default=None,
-                        choices=["none", "ollama", "openrouter"],
-                        help="LLM backend for OCR cleanup (none to skip)")
-    parser.add_argument("--cleanup-model", default=None,
-                        help="Model for cleanup (default: qwen3:8b-q4_K_M for ollama, "
-                             "qwen/qwen3-235b-a22b-2507 for openrouter)")
-    parser.add_argument("--cleanup-reasoning", type=int, choices=[0, 1], default=None,
-                        help="Enable (1) or disable (0) thinking/reasoning for cleanup model")
-    parser.add_argument("--scan-only", action="store_true",
-                        help="Only generate subtitle frame PNGs in scanned_frames/, skip SRT generation")
+    parser.add_argument(
+        "--crop",
+        default="iw*0.7:ih*0.15:iw*0.15:ih*0.8",
+        help="ffmpeg crop filter (default: iw*0.7:ih*0.15:iw*0.15:ih*0.8)",
+    )
+    parser.add_argument(
+        "--fps", type=int, default=4, help="Frames per second to sample (default: 4)"
+    )
+    parser.add_argument(
+        "--languages",
+        nargs="+",
+        default=["zh-Hant"],
+        help="OCR languages (default: zh-Hant)",
+    )
+    parser.add_argument(
+        "--cleanup-backend",
+        default=None,
+        choices=["none", "ollama", "openrouter", "claude"],
+        help="LLM backend for OCR cleanup (none to skip)",
+    )
+    parser.add_argument(
+        "--cleanup-model",
+        default=None,
+        help="Model for cleanup (default: qwen3:8b-q4_K_M for ollama, "
+        "qwen/qwen3-235b-a22b-2507 for openrouter, "
+        "claude-sonnet-4-6 for claude)",
+    )
+    parser.add_argument(
+        "--cleanup-reasoning",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Enable (1) or disable (0) thinking/reasoning for cleanup model",
+    )
+    parser.add_argument(
+        "--scan-only",
+        action="store_true",
+        help="Only generate subtitle frame PNGs in scanned_frames/, skip SRT generation",
+    )
     args = parser.parse_args()
 
     scan_only_incompatible = []
@@ -401,12 +500,16 @@ def main():
         if args.cleanup_reasoning is not None:
             scan_only_incompatible.append("--cleanup-reasoning")
         if scan_only_incompatible:
-            parser.error(f"--scan-only is incompatible with: {', '.join(scan_only_incompatible)}")
+            parser.error(
+                f"--scan-only is incompatible with: {', '.join(scan_only_incompatible)}"
+            )
     else:
         if args.cleanup_backend is None:
             parser.error("--cleanup-backend is required when not using --scan-only")
         if args.cleanup_backend != "none" and args.cleanup_reasoning is None:
-            parser.error("--cleanup-reasoning is required when --cleanup-backend is not 'none'")
+            parser.error(
+                "--cleanup-reasoning is required when --cleanup-backend is not 'none'"
+            )
 
     video_path = args.video
     if not os.path.isfile(video_path):
@@ -433,7 +536,9 @@ def main():
         ocr_texts = detect_text_frames(frames, args.languages)
         clips = build_clips(ocr_texts, sample_interval)
         text_frame_count = sum(e - s + 1 for s, e in clips)
-        print(f"Found {len(clips)} subtitle clips ({text_frame_count} frames with text)")
+        print(
+            f"Found {len(clips)} subtitle clips ({text_frame_count} frames with text)"
+        )
 
         # Copy clip frames to scanned_frames/ with timestamp names
         for s, e in clips:
@@ -468,13 +573,22 @@ def main():
             print(f"Written {len(entries)} raw subtitle entries to {raw_path}")
 
             backend = args.cleanup_backend
-            default_model = ("qwen/qwen3-235b-a22b-2507" if backend == "openrouter"
-                             else "qwen3:8b-q4_K_M")
+            default_models = {
+                "openrouter": "qwen/qwen3-235b-a22b-2507",
+                "claude": "claude-sonnet-4-6",
+                "ollama": "qwen3:8b-q4_K_M",
+            }
+            default_model = default_models.get(backend, "qwen3:8b-q4_K_M")
             cleanup_model = args.cleanup_model or default_model
             thinking = bool(args.cleanup_reasoning)
             print(f"Cleaning up OCR artifacts with {cleanup_model} ({backend})...")
-            entries = cleanup_with_llm(entries, model=cleanup_model, languages=args.languages,
-                                     thinking=thinking, backend=backend)
+            entries = cleanup_with_llm(
+                entries,
+                model=cleanup_model,
+                languages=args.languages,
+                thinking=thinking,
+                backend=backend,
+            )
             # Fuzzy dedup: merge consecutive near-duplicate entries the LLM missed
             entries = deduplicate(entries, max_dist=2)
             # Ensure every frame in detected clips is covered by a subtitle

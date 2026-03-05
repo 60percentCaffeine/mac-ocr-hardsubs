@@ -68,8 +68,23 @@ def format_timestamp(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def deduplicate(entries):
-    """Merge consecutive entries with identical text."""
+def _edit_distance(a, b):
+    """Compute Levenshtein edit distance between two strings."""
+    if len(a) < len(b):
+        return _edit_distance(b, a)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
+        prev = curr
+    return prev[-1]
+
+
+def deduplicate(entries, max_dist=0):
+    """Merge consecutive entries with identical (or near-identical) text."""
     if not entries:
         return []
 
@@ -77,7 +92,7 @@ def deduplicate(entries):
     current_text, current_start, current_end = entries[0]
 
     for text, start, end in entries[1:]:
-        if text == current_text:
+        if text == current_text or (max_dist > 0 and _edit_distance(text, current_text) <= max_dist):
             current_end = end
         else:
             merged.append((current_text, current_start, current_end))
@@ -177,7 +192,7 @@ def parse_cleanup_response(response_text, batch_entries):
     keep_pattern = re.compile(r"^KEEP\s+(\d+)\s*:\s*(.+)$", re.MULTILINE)
     remove_pattern = re.compile(r"^REMOVE\s+(\d+)\s*$", re.MULTILINE)
 
-    keeps = {int(m.group(1)): m.group(2).strip() for m in keep_pattern.finditer(response_text)}
+    keeps = {int(m.group(1)): m.group(2).strip().replace(" | ", "\n") for m in keep_pattern.finditer(response_text)}
     removes = {int(m.group(1)) for m in remove_pattern.finditer(response_text)}
 
     if not keeps and not removes:
@@ -188,7 +203,32 @@ def parse_cleanup_response(response_text, batch_entries):
         if i in removes:
             continue
         if i in keeps:
-            result.append((keeps[i], start, end))
+            cleaned = keeps[i]
+            # Guard against hallucination: if edit distance is too high relative
+            # to text length, the LLM likely rewrote rather than fixed the text.
+            # Drop the entry instead of keeping the hallucinated version.
+            original_flat = text.replace("\n", " | ")
+            # If cleaned text is a subset of the original lines (e.g. stripping
+            # non-dialogue lines from a multi-line entry), that's legitimate.
+            original_lines = set(text.split("\n"))
+            cleaned_lines_list = cleaned.split(" | ") if " | " in cleaned else [cleaned]
+            is_line_subset = set(cleaned_lines_list).issubset(original_lines)
+            if not is_line_subset:
+                # Per-line hallucination check: for each cleaned line, find its
+                # best-matching original line. If any line is too different, fall
+                # back to original text (the LLM likely rewrote it).
+                orig_lines_list = text.split("\n")
+                hallucinated = False
+                for cl in cleaned_lines_list:
+                    best_dist = min(_edit_distance(ol, cl) for ol in orig_lines_list)
+                    line_threshold = max(4, len(cl) // 3)
+                    if best_dist > line_threshold:
+                        hallucinated = True
+                        break
+                if hallucinated:
+                    result.append((text, start, end))  # Fall back to original
+                    continue
+            result.append((cleaned, start, end))
         else:
             # Not mentioned — keep unchanged (safe fallback)
             result.append((text, start, end))
@@ -213,20 +253,11 @@ def cleanup_with_llm(entries, model="qwen3:8b-q4_K_M", batch_size=30, languages=
     }
     lang_desc = ", ".join(lang_names.get(l, l) for l in languages)
 
-    system_prompt = (
-        f"You are an OCR post-processor for anime subtitles. The subtitles are in {lang_desc}.\n\n"
-        "Your job:\n"
-        "- KEEP real dialogue/narration subtitles, REMOVE OCR noise (text on clothing, signs, "
-        "UI elements, garbled/random characters)\n"
-        "- FIX minor OCR errors in kept entries (wrong characters, missing characters)\n"
-        "- If an entry mixes real subtitle text with noise, keep only the dialogue part\n"
-        "- These are closed captions: preserve exactly what is said, do not rephrase or translate\n\n"
-        "Output format — one line per entry, no extra text:\n"
-        "KEEP <id>: <cleaned text>\n"
-        "REMOVE <id>"
-    )
+    prompt_path = Path(__file__).parent / "cleanup-prompt.md"
+    system_prompt = prompt_path.read_text(encoding="utf-8").strip().format(lang_desc=lang_desc)
 
-    call_llm = call_openrouter if backend == "openrouter" else call_ollama
+    temperature = 0.2
+    call_llm_fn = call_openrouter if backend == "openrouter" else call_ollama
 
     all_results = []
     total_batches = (len(entries) + batch_size - 1) // batch_size
@@ -238,7 +269,8 @@ def cleanup_with_llm(entries, model="qwen3:8b-q4_K_M", batch_size=30, languages=
 
         user_lines = []
         for i, (text, _, _) in enumerate(batch, 1):
-            user_lines.append(f"[{i}] {text}")
+            # Replace newlines with ' | ' so multi-line entries are unambiguous
+            user_lines.append(f"[{i}] {text.replace(chr(10), ' | ')}")
         user_prompt = "\n".join(user_lines)
         if not thinking:
             user_prompt += " /no_think"
@@ -248,13 +280,13 @@ def cleanup_with_llm(entries, model="qwen3:8b-q4_K_M", batch_size=30, languages=
             {"role": "user", "content": user_prompt},
         ]
 
-        response = call_llm(messages, model=model)
+        response = call_llm_fn(messages, model=model, temperature=temperature)
         result = parse_cleanup_response(response, batch)
 
         if result is None:
             # Retry once
             print(f"  Batch {batch_idx + 1}: response unparseable, retrying...", flush=True)
-            response = call_llm(messages, model=model)
+            response = call_llm_fn(messages, model=model, temperature=temperature)
             result = parse_cleanup_response(response, batch)
             if result is None:
                 print(f"Error: LLM response for batch {batch_idx + 1} is unparseable after retry.",
@@ -335,6 +367,8 @@ def main():
             print(f"Cleaning up OCR artifacts with {cleanup_model} ({backend})...")
             entries = cleanup_with_llm(entries, model=cleanup_model, languages=args.languages,
                                      thinking=not args.no_thinking, backend=backend)
+            # Fuzzy dedup: merge consecutive near-duplicate entries the LLM missed
+            entries = deduplicate(entries, max_dist=2)
         write_srt(entries, output_path)
         print(f"Written {len(entries)} subtitle entries to {output_path}")
 

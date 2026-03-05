@@ -2,10 +2,66 @@
 
 Extract burned-in subtitles (hardsubs) from anime videos into SRT files using macOS Vision framework OCR.
 
-## Setup
+## Install
+
+Requires **macOS** (uses the native Vision framework for OCR) and **Python 3.10+**.
+
+```bash
+# Install Homebrew if you don't have it
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Install ffmpeg and Poetry
+brew install ffmpeg
+brew install poetry
+
+# Clone and install
+git clone <repo-url> && cd ocranime
+poetry install
+```
+
+### Ollama (optional)
+
+Local LLM cleanup via [Ollama](https://ollama.com/). Free, runs on your machine.
+
+```bash
+brew install ollama
+ollama serve &          # start the server
+ollama pull qwen3:8b-q4_K_M  # pull the default model
+```
+
+Then use `--cleanup-backend=ollama`.
+
+### OpenRouter (optional)
+
+Cloud LLM cleanup via [OpenRouter](https://openrouter.ai/). Create an account and get an API key, then add it to a `.env` file in the project root:
 
 ```
+OPENROUTER_API_KEY=sk-or-...
+```
+
+Then use `--cleanup-backend=openrouter`.
+
+### Claude (optional, recommended)
+
+LLM cleanup via [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Requires the `claude` CLI to be installed and authenticated.
+
+Install Claude Code, then use `--cleanup-backend=claude`.
+
+### Global install (run from anywhere)
+
+To use `ocranime` as a command from any directory:
+
+```bash
 poetry install
+# Add the virtualenv bin to your PATH
+echo 'export PATH="$(poetry env info -p)/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+Now you can run `ocranime` from anywhere:
+
+```
+ocranime video.mp4 --cleanup-backend=none
 ```
 
 ## Usage

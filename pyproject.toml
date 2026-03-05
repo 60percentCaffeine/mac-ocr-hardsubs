@@ -9,6 +9,9 @@ python = "^3.10"
 pyobjc-framework-Vision = ">=10.0"
 python-dotenv = "^1.2.2"
 
+[tool.poetry.scripts]
+ocranime = "ocranime:main"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

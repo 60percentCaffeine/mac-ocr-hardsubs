@@ -323,6 +323,11 @@ def main():
 
         entries = deduplicate(raw_entries)
         if not args.no_cleanup:
+            # Save raw (pre-cleanup) SRT alongside the final one
+            raw_path = os.path.splitext(output_path)[0] + ".raw.srt"
+            write_srt(entries, raw_path)
+            print(f"Written {len(entries)} raw subtitle entries to {raw_path}")
+
             backend = "openrouter" if args.openrouter else "ollama"
             default_model = ("qwen/qwen3-235b-a22b-2507" if args.openrouter
                              else "qwen3:8b-q4_K_M")

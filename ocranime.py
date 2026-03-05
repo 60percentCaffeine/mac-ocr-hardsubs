@@ -20,18 +20,59 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def extract_frames(video_path, tmpdir, interval, crop):
-    """Extract cropped frames from video using ffmpeg."""
+MIN_CLIP_DURATION = 0.5  # seconds — clips shorter than this are dropped
+
+
+def extract_frames(video_path, tmpdir, crop, fps):
+    """Extract cropped frames from video using ffmpeg at given fps."""
     output_pattern = os.path.join(tmpdir, "%06d.png")
     cmd = [
         "ffmpeg", "-i", video_path,
-        "-vf", f"crop={crop},fps=1/{interval}",
+        "-vf", f"crop={crop},fps={fps}",
         "-loglevel", "error",
         output_pattern,
     ]
     subprocess.run(cmd, check=True)
     frames = sorted(Path(tmpdir).glob("*.png"))
     return frames
+
+
+def detect_text_frames(frames, languages):
+    """OCR all frames, return list of recognized text (empty string if no text).
+
+    Uses accurate mode because fast mode doesn't reliably detect CJK text.
+    Results are cached so the accurate OCR pass can reuse them.
+    """
+    texts = []
+    for idx, frame in enumerate(frames):
+        text = ocr_frame(frame, languages, fast=False).strip()
+        texts.append(text)
+        progress = (idx + 1) / len(frames) * 100
+        print(f"\rOCR: {progress:.0f}%", end="", flush=True)
+    print()
+    return texts
+
+
+def build_clips(texts, sample_interval):
+    """Build clips (start_idx, end_idx) from consecutive non-empty texts, drop short ones."""
+    clips = []
+    start = None
+    for i, text in enumerate(texts):
+        if text and start is None:
+            start = i
+        elif not text and start is not None:
+            clips.append((start, i - 1))
+            start = None
+    if start is not None:
+        clips.append((start, len(texts) - 1))
+
+    # Filter out clips shorter than MIN_CLIP_DURATION
+    filtered = []
+    for s, e in clips:
+        duration = (e - s + 1) * sample_interval
+        if duration >= MIN_CLIP_DURATION:
+            filtered.append((s, e))
+    return filtered
 
 
 def ocr_frame(frame_path, languages, fast):
@@ -276,6 +317,46 @@ def cleanup_with_llm(entries, model="qwen3:8b-q4_K_M", batch_size=30, languages=
     return all_results
 
 
+def fill_clip_gaps(entries, clips, sample_interval):
+    """Extend subtitles so every frame inside detected clips is covered.
+
+    After LLM cleanup some entries may be removed, leaving gaps within clips
+    that were determined to contain subtitles.  For each uncovered frame,
+    extend the previous subtitle's end time to cover it.
+    """
+    if not entries:
+        return entries
+
+    # Build the set of timestamps (as frame indices) that must be covered
+    covered_times = set()
+    for s, e in clips:
+        for idx in range(s, e + 1):
+            covered_times.add(round(idx * sample_interval, 6))
+
+    # For each required timestamp, check if any entry covers it
+    result = list(entries)
+    for t in sorted(covered_times):
+        t_rounded = round(t, 6)
+        # Find if any entry covers this timestamp
+        covered = False
+        for text, start, end in result:
+            if round(start, 6) <= t_rounded < round(end, 6):
+                covered = True
+                break
+        if not covered:
+            # Find the last entry that ends at or before this timestamp
+            best = None
+            for i, (text, start, end) in enumerate(result):
+                if round(end, 6) <= t_rounded:
+                    best = i
+            if best is not None:
+                text, start, end = result[best]
+                new_end = round(t + sample_interval, 6)
+                result[best] = (text, start, new_end)
+
+    return result
+
+
 def write_srt(entries, output_path):
     """Write entries as SRT file."""
     with open(output_path, "w", encoding="utf-8") as f:
@@ -289,14 +370,12 @@ def main():
     parser = argparse.ArgumentParser(description="Extract hardsubs from anime video to SRT")
     parser.add_argument("video", help="Input video file path")
     parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt)")
-    parser.add_argument("-i", "--interval", type=float, default=1.0,
-                        help="Seconds between sampled frames (default: 1.0)")
     parser.add_argument("--crop", default="iw*0.7:ih*0.15:iw*0.15:ih*0.8",
                         help="ffmpeg crop filter (default: iw*0.7:ih*0.15:iw*0.15:ih*0.8)")
+    parser.add_argument("--fps", type=int, default=4,
+                        help="Frames per second to sample (default: 4)")
     parser.add_argument("--languages", nargs="+", default=["zh-Hant"],
                         help="OCR languages (default: zh-Hant)")
-    parser.add_argument("--fast", action="store_true",
-                        help="Use fast OCR mode instead of accurate")
     parser.add_argument("--cleanup-backend", default=None,
                         choices=["none", "ollama", "openrouter"],
                         help="LLM backend for OCR cleanup (none to skip)")
@@ -315,8 +394,6 @@ def main():
             scan_only_incompatible.append("--output")
         if args.languages != ["zh-Hant"]:
             scan_only_incompatible.append("--languages")
-        if args.fast:
-            scan_only_incompatible.append("--fast")
         if args.cleanup_backend is not None:
             scan_only_incompatible.append("--cleanup-backend")
         if args.cleanup_model is not None:
@@ -344,34 +421,44 @@ def main():
         shutil.rmtree(scanned_dir)
     scanned_dir.mkdir()
 
+    fps = args.fps
+    sample_interval = 1.0 / fps
+
     with tempfile.TemporaryDirectory(prefix="ocranime_") as tmpdir:
-        print(f"Extracting frames (interval={args.interval}s)...")
-        frames = extract_frames(video_path, tmpdir, args.interval, args.crop)
+        print(f"Extracting frames ({fps} fps)...")
+        frames = extract_frames(video_path, tmpdir, args.crop, fps)
         print(f"Extracted {len(frames)} frames")
 
-        # Copy frames to scanned_frames with timestamp names
-        for idx, frame in enumerate(frames):
-            timestamp = idx * args.interval
-            h = int(timestamp // 3600)
-            m = int((timestamp % 3600) // 60)
-            s = int(timestamp % 60)
-            dest = scanned_dir / f"{h:02d}-{m:02d}-{s:02d}.png"
-            shutil.copy2(frame, dest)
-        print(f"Saved {len(frames)} frame PNGs to {scanned_dir}/")
+        # OCR all frames (accurate mode — fast mode can't detect CJK)
+        ocr_texts = detect_text_frames(frames, args.languages)
+        clips = build_clips(ocr_texts, sample_interval)
+        text_frame_count = sum(e - s + 1 for s, e in clips)
+        print(f"Found {len(clips)} subtitle clips ({text_frame_count} frames with text)")
+
+        # Copy clip frames to scanned_frames/ with timestamp names
+        for s, e in clips:
+            for idx in range(s, e + 1):
+                timestamp = idx * sample_interval
+                h = int(timestamp // 3600)
+                m = int((timestamp % 3600) // 60)
+                s_sec = int(timestamp % 60)
+                ms = int(round((timestamp - int(timestamp)) * 1000))
+                dest = scanned_dir / f"{h:02d}-{m:02d}-{s_sec:02d}-{ms:03d}.png"
+                shutil.copy2(frames[idx], dest)
+        print(f"Saved {text_frame_count} frame PNGs to {scanned_dir}/")
 
         if args.scan_only:
-            print("Scan-only mode: skipping OCR and SRT generation.")
+            print("Scan-only mode: skipping SRT generation.")
             return
 
+        # Build entries from OCR results within detected clips
         raw_entries = []
-        for idx, frame in enumerate(frames):
-            timestamp = idx * args.interval
-            text = ocr_frame(frame, args.languages, args.fast).strip()
-            if text:
-                raw_entries.append((text, timestamp, timestamp + args.interval))
-            progress = (idx + 1) / len(frames) * 100
-            print(f"\rOCR: {progress:.0f}%", end="", flush=True)
-        print()
+        for s, e in clips:
+            for idx in range(s, e + 1):
+                timestamp = idx * sample_interval
+                text = ocr_texts[idx]
+                if text:
+                    raw_entries.append((text, timestamp, timestamp + sample_interval))
 
         entries = deduplicate(raw_entries)
         if args.cleanup_backend != "none":
@@ -390,6 +477,8 @@ def main():
                                      thinking=thinking, backend=backend)
             # Fuzzy dedup: merge consecutive near-duplicate entries the LLM missed
             entries = deduplicate(entries, max_dist=2)
+            # Ensure every frame in detected clips is covered by a subtitle
+            entries = fill_clip_gaps(entries, clips, sample_interval)
         write_srt(entries, output_path)
         print(f"Written {len(entries)} subtitle entries to {output_path}")
 

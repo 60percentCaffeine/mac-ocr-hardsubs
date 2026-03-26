@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract burned-in subtitles from anime videos into SRT using macOS Vision OCR."""
+"""Extract burned-in subtitles from anime videos into SRT using OCR."""
 
 import argparse
 import json
@@ -12,9 +12,6 @@ import tempfile
 import urllib.request
 import urllib.error
 from pathlib import Path
-
-import Vision
-from Foundation import NSData
 
 from dotenv import load_dotenv
 
@@ -42,15 +39,21 @@ def extract_frames(video_path, tmpdir, crop, fps):
     return frames
 
 
-def detect_text_frames(frames, languages):
+def detect_text_frames(frames, languages, scan_backend="apple"):
     """OCR all frames, return list of recognized text (empty string if no text).
 
     Uses accurate mode because fast mode doesn't reliably detect CJK text.
     Results are cached so the accurate OCR pass can reuse them.
     """
+    ocr_fn = ocr_frame_dotsocr if scan_backend == "dotsocr" else ocr_frame_apple
+
+    # Pre-load the model before starting progress display
+    if scan_backend == "dotsocr":
+        _load_dotsocr()
+
     texts = []
     for idx, frame in enumerate(frames):
-        text = ocr_frame(frame, languages, fast=False).strip()
+        text = ocr_fn(frame, languages, fast=False).strip()
         texts.append(text)
         progress = (idx + 1) / len(frames) * 100
         print(f"\rOCR: {progress:.0f}%", end="", flush=True)
@@ -80,8 +83,11 @@ def build_clips(texts, sample_interval):
     return filtered
 
 
-def ocr_frame(frame_path, languages, fast):
-    """Run Vision OCR on a single frame, return recognized text."""
+def ocr_frame_apple(frame_path, languages, fast):
+    """Run Apple Vision OCR on a single frame, return recognized text."""
+    import Vision
+    from Foundation import NSData
+
     data = NSData.dataWithContentsOfFile_(str(frame_path))
     if data is None:
         return ""
@@ -104,6 +110,105 @@ def ocr_frame(frame_path, languages, fast):
             lines.append(candidate[0].string())
 
     return "\n".join(lines)
+
+
+# ── DotsMOCR (GPU) backend ─────────────────────────────────────────────
+
+_dotsocr_model = None
+_dotsocr_processor = None
+
+
+def _load_dotsocr():
+    """Load the DotsMOCR model and processor (cached after first call)."""
+    global _dotsocr_model, _dotsocr_processor
+    if _dotsocr_model is not None:
+        return _dotsocr_model, _dotsocr_processor
+
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
+
+    model_id = os.environ.get("DOTSOCR_MODEL", "rednote-hilab/dots.mocr")
+
+    print(f"Loading DotsMOCR model ({model_id})...", flush=True)
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "sdpa"
+        # The model's remote code imports flash_attn at top level.
+        # When flash_attn isn't installed, we stub it so transformers'
+        # check_imports doesn't reject the file, and patch the vision
+        # model to use PyTorch SDPA instead at runtime.
+        import types
+        import importlib.machinery
+
+        fa_stub = types.ModuleType("flash_attn")
+        fa_stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn", None)
+        fa_stub.flash_attn_varlen_func = None  # unused with sdpa
+        sys.modules.setdefault("flash_attn", fa_stub)
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    if hasattr(config, "vision_config") and attn_impl != "flash_attention_2":
+        config.vision_config.attn_implementation = attn_impl
+    _dotsocr_model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        config=config,
+        attn_implementation=attn_impl,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    _dotsocr_processor = AutoProcessor.from_pretrained(
+        model_id, trust_remote_code=True
+    )
+    print("DotsMOCR model loaded.", flush=True)
+    return _dotsocr_model, _dotsocr_processor
+
+
+def ocr_frame_dotsocr(frame_path, languages, fast):
+    """Run DotsMOCR OCR on a single frame using GPU, return recognized text."""
+    from qwen_vl_utils import process_vision_info
+
+    model, processor = _load_dotsocr()
+
+    prompt = "Extract the text content from this image."
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": str(frame_path)},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
+
+    import logging
+    logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
+    generated_ids = model.generate(**inputs, max_new_tokens=512)
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):]
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    return output_text[0].strip() if output_text else ""
 
 
 def format_timestamp(seconds):
@@ -453,6 +558,12 @@ def main():
         description="Extract hardsubs from anime video to SRT"
     )
     parser.add_argument("video", help="Input video file path")
+    parser.add_argument(
+        "--scan-backend",
+        required=True,
+        choices=["apple", "dotsocr"],
+        help="OCR backend: apple (macOS Vision) or dotsocr (DotsMOCR on GPU/CUDA)",
+    )
     parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt)")
     parser.add_argument(
         "--crop",
@@ -540,8 +651,8 @@ def main():
         frames = extract_frames(video_path, tmpdir, args.crop, fps)
         print(f"Extracted {len(frames)} frames")
 
-        # OCR all frames (accurate mode — fast mode can't detect CJK)
-        ocr_texts = detect_text_frames(frames, args.languages)
+        # OCR all frames
+        ocr_texts = detect_text_frames(frames, args.languages, scan_backend=args.scan_backend)
         clips = build_clips(ocr_texts, sample_interval)
         text_frame_count = sum(e - s + 1 for s, e in clips)
         print(

@@ -256,6 +256,68 @@ def deduplicate(entries, max_dist=0):
     return merged
 
 
+def _texts_similar(a, b):
+    """Check if two texts are similar enough to merge a single-frame glitch."""
+    # Containment: one text is a substring of the other (handles extra OCR noise)
+    if a in b or b in a:
+        return True
+    # Edit distance with generous threshold
+    max_len = max(len(a), len(b))
+    threshold = max(2, int(max_len * 0.4))
+    if _edit_distance(a, b) <= threshold:
+        return True
+    return False
+
+
+def smart_deduplicate(entries, sample_interval):
+    """Merge single-frame entries into a neighbor when texts are similar.
+
+    If a subtitle spans only one frame and is similar to the previous or next
+    subtitle, it is likely an OCR glitch — merge it into the neighbor.
+    """
+    if not entries:
+        return []
+
+    n = len(entries)
+    skip = set()
+
+    # Forward pass: merge single-frame entries into previous
+    merged = []
+    current_text, current_start, current_end = entries[0]
+
+    for i, (text, start, end) in enumerate(entries[1:], 1):
+        duration = round(end - start, 6)
+        is_single_frame = abs(duration - sample_interval) < 1e-4
+        if is_single_frame and _texts_similar(text, current_text):
+            current_end = end
+            skip.add(i)
+            continue
+        merged.append((current_text, current_start, current_end))
+        current_text, current_start, current_end = text, start, end
+
+    merged.append((current_text, current_start, current_end))
+
+    # Backward pass: merge remaining single-frame entries into next
+    result = []
+    i = 0
+    while i < len(merged):
+        text, start, end = merged[i]
+        duration = round(end - start, 6)
+        is_single_frame = abs(duration - sample_interval) < 1e-4
+        if is_single_frame and i + 1 < len(merged):
+            next_text = merged[i + 1][1]
+            next_entry_text = merged[i + 1][0]
+            if _texts_similar(text, next_entry_text):
+                # Extend next entry's start to absorb this one
+                merged[i + 1] = (merged[i + 1][0], start, merged[i + 1][2])
+                i += 1
+                continue
+        result.append((text, start, end))
+        i += 1
+
+    return result
+
+
 def strip_thinking(text):
     """Remove <think>...</think> blocks from Qwen 3 reasoning output."""
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -685,6 +747,11 @@ def main():
                     raw_entries.append((text, timestamp, timestamp + sample_interval))
 
         entries = deduplicate(raw_entries)
+        before_smart = len(entries)
+        entries = smart_deduplicate(entries, sample_interval)
+        smart_merged = before_smart - len(entries)
+        if smart_merged:
+            print(f"Smart dedup merged {smart_merged} single-frame entries")
         if args.cleanup_backend != "none":
             # Save raw (pre-cleanup) SRT alongside the final one
             raw_path = os.path.splitext(output_path)[0] + ".raw.srt"

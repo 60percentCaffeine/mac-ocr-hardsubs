@@ -18,7 +18,7 @@ dots-mocr = {git = "https://github.com/rednote-hilab/dots.mocr.git", optional = 
 
 [tool.poetry.extras]
 apple = ["pyobjc-framework-Vision"]
-dotsocr = ["torch", "transformers", "qwen-vl-utils", "accelerate", "torchvision", "dots-mocr"]
+dotsocr = ["torch", "transformers", "qwen-vl-utils", "accelerate", "torchvision", "dots-mocr", "flash-attn"]
 
 [tool.poetry.scripts]
 ocranime = "ocranime:main"

@@ -397,6 +397,44 @@ def call_openrouter(messages, model="qwen/qwen3-235b-a22b-2507", temperature=0.3
     return strip_thinking("".join(content_parts))
 
 
+def call_mlx(messages, model="mlx-community/Qwen3-4B-4bit", temperature=0.3):
+    """Call a local MLX model via mlx-lm. Returns assistant content."""
+    from mlx_lm import load, generate
+
+    mlx_model, tokenizer = _load_mlx(model)
+
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    from mlx_lm.sample_utils import make_sampler
+
+    sampler = make_sampler(temp=temperature)
+    response = generate(
+        mlx_model,
+        tokenizer,
+        prompt=prompt,
+        max_tokens=2048,
+        sampler=sampler,
+        verbose=False,
+    )
+    return strip_thinking(response)
+
+
+_mlx_cache = {}
+
+
+def _load_mlx(model):
+    """Load and cache an MLX model+tokenizer."""
+    if model not in _mlx_cache:
+        from mlx_lm import load
+
+        print(f"Loading MLX model ({model})...", flush=True)
+        _mlx_cache[model] = load(model)
+        print("MLX model loaded.", flush=True)
+    return _mlx_cache[model]
+
+
 def call_claude(messages, model="claude-sonnet-4-6", temperature=0.3, thinking=True):
     """Call Claude via Claude Code headless mode. Returns assistant content."""
     # Build the prompt: system prompt + user message
@@ -497,6 +535,8 @@ def cleanup_with_llm(
         call_llm_fn = lambda msgs, model, temperature: call_claude(
             msgs, model=model, temperature=temperature, thinking=thinking
         )
+    elif backend == "mlx":
+        call_llm_fn = call_mlx
     else:
         call_llm_fn = call_ollama
 
@@ -630,7 +670,7 @@ def main():
     parser.add_argument(
         "--cleanup-backend",
         default=None,
-        choices=["none", "ollama", "openrouter", "claude"],
+        choices=["none", "ollama", "openrouter", "claude", "mlx"],
         help="LLM backend for OCR cleanup (none to skip)",
     )
     parser.add_argument(
@@ -638,7 +678,8 @@ def main():
         default=None,
         help="Model for cleanup (default: qwen3:8b-q4_K_M for ollama, "
         "qwen/qwen3-235b-a22b-2507 for openrouter, "
-        "claude-sonnet-4-6 for claude)",
+        "claude-sonnet-4-6 for claude, "
+        "mlx-community/Qwen3-4B-4bit for mlx)",
     )
     parser.add_argument(
         "--cleanup-reasoning",
@@ -749,6 +790,7 @@ def main():
                 "openrouter": "qwen/qwen3-235b-a22b-2507",
                 "claude": "claude-sonnet-4-6",
                 "ollama": "qwen3:8b-q4_K_M",
+                "mlx": "mlx-community/Qwen3-4B-4bit",
             }
             default_model = default_models.get(backend, "qwen3:8b-q4_K_M")
             cleanup_model = args.cleanup_model or default_model

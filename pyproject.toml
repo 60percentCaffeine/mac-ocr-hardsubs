@@ -15,10 +15,12 @@ flash-attn = {version = ">=2.5", optional = true}
 accelerate = {version = ">=0.30", optional = true}
 torchvision = {version = ">=0.17", optional = true}
 dots-mocr = {git = "https://github.com/rednote-hilab/dots.mocr.git", optional = true}
+mlx-lm = {version = ">=0.22", optional = true}
 
 [tool.poetry.extras]
 apple = ["pyobjc-framework-Vision"]
 dotsocr = ["torch", "transformers", "qwen-vl-utils", "accelerate", "torchvision", "dots-mocr", "flash-attn"]
+mlx = ["mlx-lm"]
 
 [tool.poetry.scripts]
 ocranime = "ocranime:main"

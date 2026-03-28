@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -337,16 +338,7 @@ def call_ollama(messages, model="qwen3:8b-q4_K_M", temperature=0.3):
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    try:
-        resp = urllib.request.urlopen(req, timeout=300)
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-        print(f"Error: cannot connect to Ollama at {url}: {e}", file=sys.stderr)
-        print(
-            "Make sure Ollama is running (ollama serve) and the model is pulled.",
-            file=sys.stderr,
-        )
-        print("Use --cleanup-backend=none to skip LLM cleanup.", file=sys.stderr)
-        sys.exit(1)
+    resp = urllib.request.urlopen(req, timeout=300)
     content_parts = []
     try:
         for line in resp:
@@ -384,11 +376,7 @@ def call_openrouter(messages, model="qwen/qwen3-235b-a22b-2507", temperature=0.3
             "Authorization": f"Bearer {api_key}",
         },
     )
-    try:
-        resp = urllib.request.urlopen(req, timeout=300)
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-        print(f"Error: cannot connect to OpenRouter: {e}", file=sys.stderr)
-        sys.exit(1)
+    resp = urllib.request.urlopen(req, timeout=300)
     content_parts = []
     try:
         for line in resp:
@@ -429,28 +417,19 @@ def call_claude(messages, model="claude-sonnet-4-6", temperature=0.3, thinking=T
         env = os.environ.copy()
         env["MAX_THINKING_TOKENS"] = "0"
 
-    try:
-        result = subprocess.run(
-            cmd,
-            input=user_prompt,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=env,
-        )
-    except FileNotFoundError:
-        print(
-            "Error: 'claude' CLI not found. Install Claude Code first.", file=sys.stderr
-        )
-        sys.exit(1)
-    except subprocess.TimeoutExpired:
-        print("Error: Claude CLI timed out after 300s.", file=sys.stderr)
-        sys.exit(1)
+    result = subprocess.run(
+        cmd,
+        input=user_prompt,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
 
     if result.returncode != 0:
-        print(f"Error: Claude CLI failed (exit {result.returncode}):", file=sys.stderr)
-        print(result.stderr, file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(
+            f"Claude CLI failed (exit {result.returncode}): {result.stderr}"
+        )
 
     return result.stdout.strip()
 
@@ -542,24 +521,31 @@ def cleanup_with_llm(
             {"role": "user", "content": user_prompt},
         ]
 
-        response = call_llm_fn(messages, model=model, temperature=temperature)
-        result = parse_cleanup_response(response, batch)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                response = call_llm_fn(messages, model=model, temperature=temperature)
+            except Exception as e:
+                print(
+                    f"  Batch {batch_idx + 1}: LLM call error (attempt {attempt}): {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(min(attempt * 2, 30))
+                continue
 
-        if result is None:
-            # Retry once
-            print(
-                f"  Batch {batch_idx + 1}: response unparseable, retrying...",
-                flush=True,
-            )
-            response = call_llm_fn(messages, model=model, temperature=temperature)
             result = parse_cleanup_response(response, batch)
             if result is None:
                 print(
-                    f"Error: LLM response for batch {batch_idx + 1} is unparseable after retry.",
+                    f"  Batch {batch_idx + 1}: response unparseable (attempt {attempt}), retrying...",
                     file=sys.stderr,
+                    flush=True,
                 )
-                print(f"Response was:\n{response}", file=sys.stderr)
-                sys.exit(1)
+                time.sleep(min(attempt * 2, 30))
+                continue
+
+            break
 
         all_results.extend(result)
 

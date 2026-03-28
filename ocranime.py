@@ -506,6 +506,7 @@ def cleanup_with_llm(
     languages=None,
     thinking=True,
     backend="ollama",
+    retry=False,
 ):
     """Clean OCR artifacts using LLM. Returns filtered entries."""
     if not entries:
@@ -572,16 +573,21 @@ def cleanup_with_llm(
                     file=sys.stderr,
                     flush=True,
                 )
+                if not retry:
+                    sys.exit(1)
                 time.sleep(min(attempt * 2, 30))
                 continue
 
             result = parse_cleanup_response(response, batch)
             if result is None:
                 print(
-                    f"  Batch {batch_idx + 1}: response unparseable (attempt {attempt}), retrying...",
+                    f"  Batch {batch_idx + 1}: response unparseable (attempt {attempt})",
                     file=sys.stderr,
                     flush=True,
                 )
+                if not retry:
+                    sys.exit(1)
+                print("  Retrying...", file=sys.stderr, flush=True)
                 time.sleep(min(attempt * 2, 30))
                 continue
 
@@ -687,6 +693,11 @@ def main():
         choices=[0, 1],
         default=None,
         help="Enable (1) or disable (0) thinking/reasoning for cleanup model",
+    )
+    parser.add_argument(
+        "--retry",
+        action="store_true",
+        help="Retry endlessly on LLM cleanup errors instead of aborting",
     )
     parser.add_argument(
         "--scan-only",
@@ -802,6 +813,7 @@ def main():
                 languages=args.languages,
                 thinking=thinking,
                 backend=backend,
+                retry=args.retry,
             )
             # Fuzzy dedup: merge consecutive near-duplicate entries the LLM missed
             entries = deduplicate(entries, max_dist=2)

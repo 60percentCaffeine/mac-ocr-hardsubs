@@ -40,13 +40,44 @@ def extract_frames(video_path, tmpdir, crop, fps):
     return frames
 
 
+PREFILTER_EDGE_THRESHOLD = 2.0  # frames below this edge variance are skipped
+
+
+def _frame_has_edges(frame_path):
+    """Fast heuristic: check if a frame has enough edges to plausibly contain text.
+
+    Computes mean absolute gradient in both axes. Frames with subtitles have
+    sharp edges (text outlines) that produce higher values. Frames below
+    PREFILTER_EDGE_THRESHOLD are almost certainly empty (solid/gradient background).
+    """
+    from PIL import Image
+    import numpy as np
+
+    img = np.array(Image.open(frame_path).convert("L"), dtype=np.float32)
+    dx = np.abs(np.diff(img, axis=1))
+    dy = np.abs(np.diff(img, axis=0))
+    return float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD
+
+
 def detect_text_frames(frames, languages, scan_backend="apple"):
     """OCR all frames, return list of recognized text (empty string if no text).
 
     Uses accurate mode because fast mode doesn't reliably detect CJK text.
     Results are cached so the accurate OCR pass can reuse them.
+
+    A cheap edge-variance pre-filter skips frames that clearly have no text,
+    avoiding expensive OCR on them.
     """
     ocr_fn = ocr_frame_dotsocr if scan_backend == "dotsocr" else ocr_frame_apple
+
+    # Pre-filter: skip frames that clearly have no text
+    print("Pre-filtering frames...", end="", flush=True)
+    candidates = set()
+    for idx, frame in enumerate(frames):
+        if _frame_has_edges(frame):
+            candidates.add(idx)
+    skipped = len(frames) - len(candidates)
+    print(f" {skipped}/{len(frames)} frames skipped (no text edges)")
 
     # Pre-load the model before starting progress display
     if scan_backend == "dotsocr":
@@ -54,8 +85,11 @@ def detect_text_frames(frames, languages, scan_backend="apple"):
 
     texts = []
     for idx, frame in enumerate(frames):
-        text = ocr_fn(frame, languages, fast=False).strip()
-        texts.append(text)
+        if idx not in candidates:
+            texts.append("")
+        else:
+            text = ocr_fn(frame, languages, fast=False).strip()
+            texts.append(text)
         progress = (idx + 1) / len(frames) * 100
         print(f"\rOCR: {progress:.0f}%", end="", flush=True)
     print()

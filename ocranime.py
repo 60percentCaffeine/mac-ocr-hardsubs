@@ -41,6 +41,15 @@ def extract_frames(video_path, tmpdir, crop, fps):
 
 
 PREFILTER_EDGE_THRESHOLD = 2.0  # frames below this edge variance are skipped
+FRAMEDIFF_THRESHOLD = 5.0  # frames with mean pixel diff below this reuse prev OCR
+
+
+def _load_frame_gray(frame_path):
+    """Load a frame as a grayscale float32 numpy array."""
+    from PIL import Image
+    import numpy as np
+
+    return np.array(Image.open(frame_path).convert("L"), dtype=np.float32)
 
 
 def _frame_has_edges(frame_path):
@@ -50,13 +59,19 @@ def _frame_has_edges(frame_path):
     sharp edges (text outlines) that produce higher values. Frames below
     PREFILTER_EDGE_THRESHOLD are almost certainly empty (solid/gradient background).
     """
-    from PIL import Image
     import numpy as np
 
-    img = np.array(Image.open(frame_path).convert("L"), dtype=np.float32)
+    img = _load_frame_gray(frame_path)
     dx = np.abs(np.diff(img, axis=1))
     dy = np.abs(np.diff(img, axis=0))
     return float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD
+
+
+def _frames_are_similar(prev_arr, curr_arr):
+    """Check if two frames are similar enough to reuse the previous OCR result."""
+    import numpy as np
+
+    return float(np.mean(np.abs(curr_arr - prev_arr))) < FRAMEDIFF_THRESHOLD
 
 
 def detect_text_frames(frames, languages, scan_backend="apple"):
@@ -65,34 +80,57 @@ def detect_text_frames(frames, languages, scan_backend="apple"):
     Uses accurate mode because fast mode doesn't reliably detect CJK text.
     Results are cached so the accurate OCR pass can reuse them.
 
-    A cheap edge-variance pre-filter skips frames that clearly have no text,
-    avoiding expensive OCR on them.
+    Two cheap pre-filters avoid expensive OCR calls:
+    1. Edge variance — skip frames that clearly have no text.
+    2. Frame differencing — reuse the previous OCR result when consecutive
+       frames are nearly identical (same subtitle held across frames).
     """
+    import numpy as np
+
     ocr_fn = ocr_frame_dotsocr if scan_backend == "dotsocr" else ocr_frame_apple
 
     # Pre-filter: skip frames that clearly have no text
     print("Pre-filtering frames...", end="", flush=True)
     candidates = set()
+    frame_arrays = {}
     for idx, frame in enumerate(frames):
-        if _frame_has_edges(frame):
+        arr = _load_frame_gray(frame)
+        frame_arrays[idx] = arr
+        dx = np.abs(np.diff(arr, axis=1))
+        dy = np.abs(np.diff(arr, axis=0))
+        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
             candidates.add(idx)
-    skipped = len(frames) - len(candidates)
-    print(f" {skipped}/{len(frames)} frames skipped (no text edges)")
+    edge_skipped = len(frames) - len(candidates)
+    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
 
     # Pre-load the model before starting progress display
     if scan_backend == "dotsocr":
         _load_dotsocr()
 
     texts = []
+    diff_reused = 0
+    last_ocr_text = ""
+    last_ocr_arr = None
     for idx, frame in enumerate(frames):
         if idx not in candidates:
             texts.append("")
+            last_ocr_text = ""
+            last_ocr_arr = None
+        elif last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, frame_arrays[idx]):
+            texts.append(last_ocr_text)
+            diff_reused += 1
         else:
             text = ocr_fn(frame, languages, fast=False).strip()
             texts.append(text)
+            last_ocr_text = text
+            last_ocr_arr = frame_arrays[idx]
         progress = (idx + 1) / len(frames) * 100
         print(f"\rOCR: {progress:.0f}%", end="", flush=True)
     print()
+    if diff_reused:
+        print(f"Frame differencing reused OCR for {diff_reused} frames")
+    # Free frame arrays
+    frame_arrays.clear()
     return texts
 
 

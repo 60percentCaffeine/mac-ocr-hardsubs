@@ -46,11 +46,28 @@ def detect_text_frames(frames, languages, scan_backend="apple"):
     Uses accurate mode because fast mode doesn't reliably detect CJK text.
     Results are cached so the accurate OCR pass can reuse them.
     """
-    ocr_fn = ocr_frame_dotsocr if scan_backend == "dotsocr" else ocr_frame_apple
+    scan_backend_fns = {
+        "apple": ocr_frame_apple,
+        "dotsocr": ocr_frame_dotsocr,
+        "dots-4bit": ocr_frame_dots4bit,
+        "chandra-ocr2": ocr_frame_chandra,
+        "chandra-ocr2-q4": ocr_frame_chandra_q4,
+        "lighton": lambda fp, lang, fast: ocr_frame_lighton(fp, lang, fast, model_id="lightonai/LightOnOCR-2-1B"),
+        "lighton-soup": lambda fp, lang, fast: ocr_frame_lighton(fp, lang, fast, model_id="lightonai/LightOnOCR-2-1B-ocr-soup"),
+    }
+    ocr_fn = scan_backend_fns[scan_backend]
 
     # Pre-load the model before starting progress display
-    if scan_backend == "dotsocr":
-        _load_dotsocr()
+    loaders = {
+        "dotsocr": _load_dotsocr,
+        "dots-4bit": _load_dots4bit,
+        "chandra-ocr2": _load_chandra,
+        "chandra-ocr2-q4": _load_chandra_q4,
+        "lighton": lambda: _load_lighton("lightonai/LightOnOCR-2-1B"),
+        "lighton-soup": lambda: _load_lighton("lightonai/LightOnOCR-2-1B-ocr-soup"),
+    }
+    if scan_backend in loaders:
+        loaders[scan_backend]()
 
     texts = []
     for idx, frame in enumerate(frames):
@@ -162,8 +179,21 @@ def _load_dotsocr():
     _dotsocr_processor = AutoProcessor.from_pretrained(
         model_id, trust_remote_code=True
     )
+
     print("DotsMOCR model loaded.", flush=True)
     return _dotsocr_model, _dotsocr_processor
+
+
+def _dots_generate(model, inputs, max_new_tokens=512):
+    """Generate with dots.mocr models."""
+    import torch
+    # Remove keys not accepted by the model
+    inputs.pop("mm_token_type_ids", None)
+    # For transformers 4.x compat, provide cache_position
+    seq_len = inputs.input_ids.shape[-1]
+    if not hasattr(model, '_transformers_5'):
+        return model.generate(**inputs, max_new_tokens=max_new_tokens)
+    return model.generate(**inputs, max_new_tokens=max_new_tokens)
 
 
 def ocr_frame_dotsocr(frame_path, languages, fast):
@@ -199,7 +229,7 @@ def ocr_frame_dotsocr(frame_path, languages, fast):
 
     import logging
     logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
-    generated_ids = model.generate(**inputs, max_new_tokens=512)
+    generated_ids = _dots_generate(model, inputs)
     generated_ids_trimmed = [
         out_ids[len(in_ids):]
         for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -210,6 +240,257 @@ def ocr_frame_dotsocr(frame_path, languages, fast):
         clean_up_tokenization_spaces=False,
     )
     return output_text[0].strip() if output_text else ""
+
+
+# ── Dots 4-bit (bitsandbytes NF4) backend ────────────────────────────
+
+_dots4bit_model = None
+_dots4bit_processor = None
+
+
+def _load_dots4bit():
+    """Load the 4-bit quantized DotsMOCR model (cached after first call)."""
+    global _dots4bit_model, _dots4bit_processor
+    if _dots4bit_model is not None:
+        return _dots4bit_model, _dots4bit_processor
+
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
+
+    model_id = "Durgaram/dots.mocr-4bit"
+
+    print(f"Loading dots-4bit model ({model_id})...", flush=True)
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "sdpa"
+        import types
+        import importlib.machinery
+
+        fa_stub = types.ModuleType("flash_attn")
+        fa_stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn", None)
+        fa_stub.flash_attn_varlen_func = None
+        sys.modules.setdefault("flash_attn", fa_stub)
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    if hasattr(config, "vision_config") and attn_impl != "flash_attention_2":
+        config.vision_config.attn_implementation = attn_impl
+    _dots4bit_model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        config=config,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    # Fix dtype mismatch: vision tower weights are float16 but bnb compute dtype is bfloat16
+    if hasattr(_dots4bit_model, "vision_tower"):
+        _dots4bit_model.vision_tower = _dots4bit_model.vision_tower.to(torch.bfloat16)
+    _dots4bit_processor = AutoProcessor.from_pretrained(
+        model_id, trust_remote_code=True
+    )
+    print("dots-4bit model loaded.", flush=True)
+    return _dots4bit_model, _dots4bit_processor
+
+
+def ocr_frame_dots4bit(frame_path, languages, fast):
+    """Run dots-4bit OCR on a single frame."""
+    from qwen_vl_utils import process_vision_info
+
+    model, processor = _load_dots4bit()
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": str(frame_path)},
+                {"type": "text", "text": "Extract the text content from this image."},
+            ],
+        }
+    ]
+
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
+
+    import logging
+    logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
+    generated_ids = _dots_generate(model, inputs)
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):]
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    return output_text[0].strip() if output_text else ""
+
+
+# ── Chandra OCR 2 backend ────────────────────────────────────────────
+
+_chandra_model = None
+_chandra_processor = None
+
+
+def _load_chandra():
+    """Load Chandra OCR 2 model (cached after first call)."""
+    global _chandra_model, _chandra_processor
+    if _chandra_model is not None:
+        return _chandra_model, _chandra_processor
+
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    model_id = "datalab-to/chandra-ocr-2"
+
+    print(f"Loading Chandra OCR 2 model ({model_id})...", flush=True)
+    _chandra_model = AutoModelForImageTextToText.from_pretrained(
+        model_id,
+        dtype=torch.bfloat16,
+        device_map="auto",
+    )
+    _chandra_model.eval()
+    _chandra_processor = AutoProcessor.from_pretrained(model_id)
+    _chandra_processor.tokenizer.padding_side = "left"
+    print("Chandra OCR 2 model loaded.", flush=True)
+    return _chandra_model, _chandra_processor
+
+
+def ocr_frame_chandra(frame_path, languages, fast):
+    """Run Chandra OCR 2 on a single frame."""
+    from PIL import Image
+    from chandra.model.hf import generate_hf
+    from chandra.model.schema import BatchInputItem
+
+    model, processor = _load_chandra()
+
+    batch = [
+        BatchInputItem(
+            image=Image.open(str(frame_path)),
+            prompt_type="ocr_with_format",
+        )
+    ]
+
+    results = generate_hf(batch, model)
+    return results[0].raw.strip() if results else ""
+
+
+# ── Chandra OCR 2 Q4 GGUF backend ────────────────────────────────────
+
+_chandra_q4_model = None
+
+
+def _load_chandra_q4():
+    """Load Chandra OCR 2 Q4_K_M GGUF model (cached after first call)."""
+    global _chandra_q4_model
+    if _chandra_q4_model is not None:
+        return _chandra_q4_model
+
+    from llama_cpp import Llama
+    from llama_cpp.llama_chat_format import Llava15ChatHandler
+    from huggingface_hub import hf_hub_download
+
+    repo_id = "prithivMLmods/chandra-ocr-2-GGUF"
+
+    print(f"Loading Chandra OCR 2 Q4_K_M GGUF ({repo_id})...", flush=True)
+    model_path = hf_hub_download(repo_id=repo_id, filename="chandra-ocr-2-Q4_K_M.gguf")
+    mmproj_path = hf_hub_download(repo_id=repo_id, filename="chandra-ocr-2.mmproj-f16.gguf")
+
+    chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path)
+    _chandra_q4_model = Llama(
+        model_path=model_path,
+        chat_handler=chat_handler,
+        n_ctx=4096,
+        n_gpu_layers=-1,
+    )
+    print("Chandra OCR 2 Q4_K_M GGUF loaded.", flush=True)
+    return _chandra_q4_model
+
+
+def ocr_frame_chandra_q4(frame_path, languages, fast):
+    """Run Chandra OCR 2 Q4 GGUF on a single frame."""
+    import base64
+
+    llm = _load_chandra_q4()
+
+    with open(str(frame_path), "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    response = llm.create_chat_completion(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                    {"type": "text", "text": "OCR this image. Output the text content."},
+                ],
+            }
+        ],
+        max_tokens=512,
+    )
+    return response["choices"][0]["message"]["content"].strip() if response["choices"] else ""
+
+
+# ── LightOn OCR backend ──────────────────────────────────────────────
+
+_lighton_cache = {}
+
+
+def _load_lighton(model_id):
+    """Load a LightOn OCR model (cached per model_id)."""
+    if model_id in _lighton_cache:
+        return _lighton_cache[model_id]
+
+    import torch
+    from transformers import LightOnOcrForConditionalGeneration, LightOnOcrProcessor
+
+    print(f"Loading LightOn OCR model ({model_id})...", flush=True)
+    model = LightOnOcrForConditionalGeneration.from_pretrained(
+        model_id, torch_dtype=torch.bfloat16
+    ).to("cuda")
+    processor = LightOnOcrProcessor.from_pretrained(model_id)
+    _lighton_cache[model_id] = (model, processor)
+    print("LightOn OCR model loaded.", flush=True)
+    return model, processor
+
+
+def ocr_frame_lighton(frame_path, languages, fast, model_id="lightonai/LightOnOCR-2-1B"):
+    """Run LightOn OCR on a single frame."""
+    import torch
+
+    model, processor = _load_lighton(model_id)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "image", "url": str(frame_path)}]}
+    ]
+
+    inputs = processor.apply_chat_template(
+        conversation,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inputs = {
+        k: v.to(device="cuda", dtype=torch.bfloat16) if v.is_floating_point() else v.to("cuda")
+        for k, v in inputs.items()
+    }
+
+    import logging
+    logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
+    output_ids = model.generate(**inputs, max_new_tokens=512)
+    generated_ids = output_ids[0, inputs["input_ids"].shape[1]:]
+    return processor.decode(generated_ids, skip_special_tokens=True).strip()
 
 
 def format_timestamp(seconds):
@@ -655,8 +936,8 @@ def main():
     parser.add_argument(
         "--scan-backend",
         required=True,
-        choices=["apple", "dotsocr"],
-        help="OCR backend: apple (macOS Vision) or dotsocr (DotsMOCR on GPU/CUDA)",
+        choices=["apple", "dotsocr", "dots-4bit", "chandra-ocr2", "chandra-ocr2-q4", "lighton", "lighton-soup"],
+        help="OCR backend for text extraction",
     )
     parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt)")
     parser.add_argument(

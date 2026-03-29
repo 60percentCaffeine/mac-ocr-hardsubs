@@ -135,18 +135,10 @@ def _load_dotsocr():
         import flash_attn  # noqa: F401
         attn_impl = "flash_attention_2"
     except ImportError:
-        attn_impl = "sdpa"
-        # The model's remote code imports flash_attn at top level.
-        # When flash_attn isn't installed, we stub it so transformers'
-        # check_imports doesn't reject the file, and patch the vision
-        # model to use PyTorch SDPA instead at runtime.
-        import types
-        import importlib.machinery
-
-        fa_stub = types.ModuleType("flash_attn")
-        fa_stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn", None)
-        fa_stub.flash_attn_varlen_func = None  # unused with sdpa
-        sys.modules.setdefault("flash_attn", fa_stub)
+        sys.exit(
+            "Error: flash-attn is required for the dotsocr backend but is not installed.\n"
+            "Install it with: poetry run pip install flash-attn --no-build-isolation"
+        )
 
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     if hasattr(config, "vision_config") and attn_impl != "flash_attention_2":

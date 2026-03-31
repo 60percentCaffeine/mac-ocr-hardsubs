@@ -186,6 +186,107 @@ def ocr_frame_apple(frame_path, languages, fast):
     return "\n".join(lines)
 
 
+def _apple_worker_ocr(task):
+    """Worker function: OCR one frame with Apple Vision, return (task_idx, text)."""
+    task_idx, frame_path, languages = task
+    text = ocr_frame_apple(frame_path, languages, fast=False).strip()
+    return task_idx, text
+
+
+def _apple_warmup(languages):
+    """Warm up a worker by importing Vision framework."""
+    import Vision  # noqa: F401
+    return True
+
+
+def detect_text_frames_apple(frames, languages, num_workers=None):
+    """OCR frames using Apple Vision with parallel processes for speed.
+
+    Uses multiprocessing (spawn) so each worker gets its own Vision
+    framework instance with full CPU parallelism.  Workers warm up
+    while the main process pre-filters frames.
+    """
+    import numpy as np
+    from multiprocessing import get_context
+
+    if num_workers is None:
+        num_workers = min(os.cpu_count() or 1, 1)
+
+    # Start worker pool and warm up in background while we pre-filter
+    ctx = get_context("spawn")
+    pool = ctx.Pool(processes=num_workers)
+    warmup_results = [pool.apply_async(_apple_warmup, (languages,)) for _ in range(num_workers)]
+
+    # Pre-filter: skip frames that clearly have no text
+    print("Pre-filtering frames...", end="", flush=True)
+    candidates = set()
+    frame_arrays = {}
+    for idx, frame in enumerate(frames):
+        arr = _load_frame_gray(frame)
+        frame_arrays[idx] = arr
+        dx = np.abs(np.diff(arr, axis=1))
+        dy = np.abs(np.diff(arr, axis=0))
+        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
+            candidates.add(idx)
+    edge_skipped = len(frames) - len(candidates)
+    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
+
+    # Build list of frames that need OCR (applying frame differencing)
+    texts = [""] * len(frames)
+    ocr_indices = []
+    diff_reused = 0
+    last_ocr_arr = None
+    for idx in range(len(frames)):
+        if idx not in candidates:
+            last_ocr_arr = None
+        elif last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, frame_arrays[idx]):
+            diff_reused += 1
+        else:
+            ocr_indices.append(idx)
+            last_ocr_arr = frame_arrays[idx]
+
+    if diff_reused:
+        print(f"Frame differencing will reuse OCR for {diff_reused} frames")
+
+    # Wait for all workers to finish warming up
+    for r in warmup_results:
+        r.get()
+
+    total_ocr = len(ocr_indices)
+    ocr_tasks = [(i, str(frames[ocr_indices[i]]), languages) for i in range(total_ocr)]
+
+    print(f"OCR: 0% (0/{total_ocr} frames, {num_workers} workers)", end="", flush=True)
+    done = 0
+    for task_idx, text in pool.imap_unordered(_apple_worker_ocr, ocr_tasks):
+        texts[ocr_indices[task_idx]] = text
+        done += 1
+        progress = done / total_ocr * 100 if total_ocr else 100
+        print(f"\rOCR: {progress:.0f}% ({done}/{total_ocr} frames, {num_workers} workers)", end="", flush=True)
+    pool.close()
+    pool.join()
+
+    # Propagate OCR results to diff-reused frames
+    ocr_set = set(ocr_indices)
+    last_ocr_text = ""
+    last_ocr_arr = None
+    for idx in range(len(frames)):
+        if idx not in candidates:
+            last_ocr_text = ""
+            last_ocr_arr = None
+        elif idx in ocr_set:
+            last_ocr_text = texts[idx]
+            last_ocr_arr = frame_arrays[idx]
+        else:
+            if last_ocr_arr is not None:
+                texts[idx] = last_ocr_text
+
+    print()
+    if diff_reused:
+        print(f"Frame differencing reused OCR for {diff_reused} frames")
+    frame_arrays.clear()
+    return texts
+
+
 # ── DotsMOCR (GPU) backend ─────────────────────────────────────────────
 
 _dotsocr_model = None
@@ -1648,7 +1749,7 @@ def main():
         "--scan-threads",
         type=int,
         default=None,
-        help="Number of worker threads/processes for screenai backend (default: min(cpu_count, 8))",
+        help="Number of worker processes for apple/screenai backends (default: 1)",
     )
     parser.add_argument(
         "--scan-only",
@@ -1707,6 +1808,8 @@ def main():
             ocr_texts = detect_text_frames_batched(frames, args.languages, batch_size=args.scan_batch_size)
         elif args.scan_backend == "screenai":
             ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=args.scan_batch_size)
+        elif args.scan_backend == "apple":
+            ocr_texts = detect_text_frames_apple(frames, args.languages, num_workers=args.scan_threads)
         else:
             ocr_texts = detect_text_frames(frames, args.languages, scan_backend=args.scan_backend)
         clips = build_clips(ocr_texts, sample_interval)

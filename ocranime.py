@@ -934,6 +934,15 @@ def _edit_distance(a, b):
     return prev[-1]
 
 
+def _strip_outer_parens(text):
+    """Strip outer full-width or half-width parentheses for comparison."""
+    if (text.startswith("（") and text.endswith("）")) or (
+        text.startswith("(") and text.endswith(")")
+    ):
+        return text[1:-1]
+    return text
+
+
 def deduplicate(entries, max_dist=0):
     """Merge consecutive entries with identical (or near-identical) text."""
     if not entries:
@@ -943,10 +952,21 @@ def deduplicate(entries, max_dist=0):
     current_text, current_start, current_end = entries[0]
 
     for text, start, end in entries[1:]:
-        if text == current_text or (
-            max_dist > 0 and _edit_distance(text, current_text) <= max_dist
-        ):
+        if text == current_text:
             current_end = end
+        elif max_dist > 0:
+            # Compare with outer parentheses stripped so e.g.
+            # "ひ在殺時間" vs "（正在殺時間）" can merge (distance on inner text)
+            a = _strip_outer_parens(current_text)
+            b = _strip_outer_parens(text)
+            if _edit_distance(a, b) <= max_dist:
+                # Keep the longer (likely more accurate) text
+                if len(text) > len(current_text):
+                    current_text = text
+                current_end = end
+            else:
+                merged.append((current_text, current_start, current_end))
+                current_text, current_start, current_end = text, start, end
         else:
             merged.append((current_text, current_start, current_end))
             current_text, current_start, current_end = text, start, end

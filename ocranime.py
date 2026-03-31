@@ -636,9 +636,48 @@ def _screenai_worker_ocr(task):
 
 
 
+def _ensure_screenai_protos():
+    """Generate screenai_protos Python bindings if missing."""
+    proto_pkg = Path(__file__).parent / "screenai_protos"
+    pb2_file = proto_pkg / "chrome_screen_ai_pb2.py"
+    proto_file = proto_pkg / "chrome_screen_ai.proto"
+    if pb2_file.exists():
+        return
+    if not proto_file.exists():
+        sys.exit("Error: screenai_protos/chrome_screen_ai.proto not found")
+    project_root = str(Path(__file__).parent)
+    # Try grpc_tools first (pure Python, no system dependency)
+    try:
+        from grpc_tools import protoc as grpc_protoc
+        rc = grpc_protoc.main(["grpc_tools.protoc", f"--proto_path={project_root}",
+                               f"--python_out={project_root}",
+                               str(proto_file.relative_to(project_root))])
+        if rc == 0 and pb2_file.exists():
+            return
+    except ImportError:
+        pass
+    # Fall back to system protoc
+    protoc_bin = shutil.which("protoc")
+    if protoc_bin:
+        try:
+            subprocess.run([protoc_bin, f"--proto_path={project_root}",
+                            f"--python_out={project_root}",
+                            str(proto_file.relative_to(project_root))],
+                           check=True, capture_output=True)
+            if pb2_file.exists():
+                return
+        except subprocess.CalledProcessError:
+            pass
+    sys.exit("Error: could not generate screenai protobuf bindings. "
+             "Install protoc (e.g. brew install protobuf) or "
+             "pip install grpcio-tools, then retry.")
+
+
 def _ensure_screenai_downloaded():
     """Download Screen AI model files if needed (call before spawning workers)."""
     import platform
+
+    _ensure_screenai_protos()
 
     model_dir = Path.home() / ".config" / "screen_ai" / "resources"
     if model_dir.exists():

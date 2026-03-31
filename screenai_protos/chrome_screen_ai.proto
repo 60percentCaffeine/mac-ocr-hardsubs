@@ -1,0 +1,90 @@
+// Copyright 2022 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Converted to proto3 from the Chromium edition="2023" original at:
+// https://chromium.googlesource.com/chromium/src/+/main/services/screen_ai/proto/chrome_screen_ai.proto
+
+syntax = "proto3";
+
+package chrome_screen_ai;
+
+message Rect {
+  int32 x = 1;
+  int32 y = 2;
+  int32 width = 3;
+  int32 height = 4;
+  float angle = 5;
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_LEFT_TO_RIGHT = 1;
+  DIRECTION_RIGHT_TO_LEFT = 2;
+  DIRECTION_TOP_TO_BOTTOM = 3;
+}
+
+message LineBox {
+  repeated WordBox words = 1;
+  Rect bounding_box = 2;
+  string utf8_string = 3;
+  string language = 4;
+  int32 block_id = 5;
+  reserved 6;
+  Direction direction = 7;
+  ContentType content_type = 8;
+  reserved 9;
+  float confidence = 10;
+  int32 paragraph_id = 11;
+}
+
+message WordBox {
+  repeated SymbolBox symbols = 1;
+  Rect bounding_box = 2;
+  string utf8_string = 3;
+  reserved 4;
+  string language = 5;
+  bool has_space_after = 6 [deprecated = true];
+  bool estimate_color_success = 7;
+  int32 foreground_gray_value = 8;
+  int32 background_gray_value = 9;
+  int32 foreground_rgb_value = 10;
+  int32 background_rgb_value = 11;
+  Direction direction = 12;
+  ContentType content_type = 13;
+  reserved 14;
+  float confidence = 15;
+  bool estimate_gray_success = 16;
+  Rect whitespace_bounding_box = 17;
+}
+
+message SymbolBox {
+  Rect bounding_box = 1;
+  string utf8_string = 2;
+  float confidence = 3;
+}
+
+enum Orientation {
+  ORIENTATION_DEFAULT = 0;
+  ORIENTATION_HORIZONTAL = 1;
+  ORIENTATION_VERTICAL = 2;
+  ORIENTATION_ROTATED_HORIZONTAL = 3;
+  ORIENTATION_ROTATED_VERTICAL = 4;
+}
+
+enum ContentType {
+  CONTENT_TYPE_PRINTED_TEXT = 0;
+  CONTENT_TYPE_HANDWRITTEN_TEXT = 1;
+  CONTENT_TYPE_IMAGE = 2;
+  CONTENT_TYPE_LINE_DRAWING = 3;
+  CONTENT_TYPE_SEPARATOR = 4;
+  CONTENT_TYPE_UNREADABLE_TEXT = 5;
+  CONTENT_TYPE_FORMULA = 6;
+  CONTENT_TYPE_HANDWRITTEN_FORMULA = 7;
+  CONTENT_TYPE_SIGNATURE = 8;
+}
+
+message VisualAnnotation {
+  reserved 1;
+  repeated LineBox lines = 2;
+}

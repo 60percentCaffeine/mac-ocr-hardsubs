@@ -19,12 +19,13 @@ bitsandbytes = {version = ">=0.43", optional = true}
 mlx-lm = {version = ">=0.22", optional = true}
 pillow = "^12.1.1"
 protobuf = {version = ">=5.0", optional = true}
+grpcio-tools = {version = ">=1.60", optional = true}
 
 [tool.poetry.extras]
 apple = ["pyobjc-framework-Vision"]
 dotsocr = ["torch", "transformers", "qwen-vl-utils", "accelerate", "torchvision", "dots-mocr", "flash-attn"]
 dots4bit = ["torch", "transformers", "qwen-vl-utils", "accelerate", "torchvision", "dots-mocr", "bitsandbytes"]
-screenai = ["protobuf"]
+screenai = ["protobuf", "grpcio-tools"]
 mlx = ["mlx-lm"]
 
 [tool.poetry.scripts]

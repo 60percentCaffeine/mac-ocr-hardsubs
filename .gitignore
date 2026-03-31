@@ -3,4 +3,5 @@ test.srt
 test.raw.srt
 .env
 __pycache__
+screenai_protos/*_pb2.py
 scanned_frames/

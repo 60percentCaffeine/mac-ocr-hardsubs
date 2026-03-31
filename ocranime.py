@@ -381,7 +381,7 @@ def ocr_frame_dots4bit(frame_path, languages, fast):
     return results[0] if results else ""
 
 
-DOTS4BIT_BATCH_SIZE = 16
+DOTS4BIT_BATCH_SIZE = 64
 
 
 def detect_text_frames_batched(frames, languages, batch_size=DOTS4BIT_BATCH_SIZE):
@@ -957,6 +957,12 @@ def main():
         help="Retry endlessly on LLM cleanup errors instead of aborting",
     )
     parser.add_argument(
+        "--scan-batch-size",
+        type=int,
+        default=DOTS4BIT_BATCH_SIZE,
+        help=f"Batch size for dots4bit backend (default: {DOTS4BIT_BATCH_SIZE})",
+    )
+    parser.add_argument(
         "--scan-only",
         action="store_true",
         help="Only generate subtitle frame PNGs in scanned_frames/, skip SRT generation",
@@ -1010,7 +1016,7 @@ def main():
 
         # OCR all frames
         if args.scan_backend == "dots4bit":
-            ocr_texts = detect_text_frames_batched(frames, args.languages)
+            ocr_texts = detect_text_frames_batched(frames, args.languages, batch_size=args.scan_batch_size)
         else:
             ocr_texts = detect_text_frames(frames, args.languages, scan_backend=args.scan_backend)
         clips = build_clips(ocr_texts, sample_interval)

@@ -756,6 +756,114 @@ def parse_cleanup_response(response_text, batch_entries):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Rules-based cleanup (no LLM)
+# ---------------------------------------------------------------------------
+
+# Characters that legitimately appear in CJK subtitles.  Anything outside
+# this set is considered OCR noise and stripped from each line.
+_SUBTITLE_WHITELIST_RE = re.compile(
+    r"["
+    r"\u0020-\u007E"       # ASCII (letters, digits, basic punctuation)
+    r"\u00C0-\u024F"       # Latin Extended (accented letters)
+    r"\u2000-\u206F"       # General Punctuation (—, –, ', ', ", ", …, etc.)
+    r"\u2150-\u218F"       # Number Forms (fractions)
+    r"\u2190-\u21FF"       # Arrows
+    r"\u22EF"              # ⋯ midline ellipsis
+    r"\u2500-\u257F"       # Box Drawing
+    r"\u3000-\u303F"       # CJK Symbols & Punctuation (　、。〈〉《》「」『』【】〜)
+    r"\u3040-\u309F"       # Hiragana
+    r"\u30A0-\u30FF"       # Katakana
+    r"\u4E00-\u9FFF"       # CJK Unified Ideographs
+    r"\uF900-\uFAFF"       # CJK Compatibility Ideographs
+    r"\uFE30-\uFE4F"       # CJK Compatibility Forms
+    r"\uFF00-\uFFEF"       # Halfwidth & Fullwidth Forms (！＂＃, ０-９, Ａ-Ｚ, etc.)
+    r"\U00020000-\U0002A6DF"  # CJK Unified Ideographs Extension B (rare chars)
+    r"]"
+)
+
+# Hiragana U+3040-309F, Katakana U+30A0-30FF
+_KANA_RE = re.compile(r"[\u3040-\u30FF]")
+
+
+def _is_mostly_kana(text):
+    """Return True if text is predominantly Japanese kana/punctuation."""
+    stripped = re.sub(r"[\s.,!?。、！？…⋯\-()（）「」『』【】]", "", text)
+    if not stripped:
+        return True
+    kana_count = sum(1 for c in stripped if "\u3040" <= c <= "\u30FF")
+    return kana_count / len(stripped) >= 0.5
+
+
+def _strip_non_whitelist(text):
+    """Remove characters not in the subtitle whitelist."""
+    return "".join(c for c in text if _SUBTITLE_WHITELIST_RE.match(c))
+
+
+def _fix_punctuation(text):
+    """Fix common OCR punctuation errors."""
+    # Normalize various ellipsis forms to ⋯
+    text = re.sub(r"\.{2,}", "⋯", text)
+    text = re.sub(r"。{2,}", "⋯", text)
+    text = re.sub(r"…+", "⋯", text)
+    # 。0 or trailing 0 at end of sentence → ⋯
+    text = re.sub(r"。0", "⋯", text)
+    # •。 or ·。 or stray dot combinations → ⋯
+    text = re.sub(r"[•·]。", "⋯", text)
+    text = re.sub(r"[•·]{2,}", "⋯", text)
+    # Stray quotes before repeated chars (hesitation pattern)
+    # e.g. 我"我 or 我"。我 → 我⋯我
+    text = re.sub(r'(["\u201C\u201D])([。]?)', lambda m: "⋯", text)
+    return text
+
+
+def _clean_line(line):
+    """Clean a single subtitle line. Returns cleaned line or None to remove."""
+    line = line.strip()
+    if not line:
+        return None
+
+    # Strip characters outside the subtitle whitelist (Arabic, Cyrillic, etc.)
+    line = _strip_non_whitelist(line).strip()
+    if not line:
+        return None
+
+    # Pure kana line → remove
+    if _is_mostly_kana(line):
+        return None
+
+    # Fix punctuation
+    line = _fix_punctuation(line)
+
+    return line if line else None
+
+
+def cleanup_rules(entries, languages=None):
+    """Clean OCR artifacts using deterministic rules. Returns filtered entries."""
+    if not entries:
+        return entries
+
+    if languages is None:
+        languages = ["zh-Hant"]
+
+    result = []
+    for text, start, end in entries:
+        lines = text.split("\n")
+        cleaned_lines = []
+        for line in lines:
+            cleaned = _clean_line(line)
+            if cleaned is not None:
+                cleaned_lines.append(cleaned)
+
+        if not cleaned_lines:
+            continue
+
+        new_text = "\n".join(cleaned_lines)
+        result.append((new_text, start, end))
+
+    return result
+
+
 def cleanup_with_llm(
     entries,
     model="qwen3:8b-q4_K_M",
@@ -933,8 +1041,8 @@ def main():
     parser.add_argument(
         "--cleanup-backend",
         default=None,
-        choices=["none", "ollama", "openrouter", "claude", "mlx"],
-        help="LLM backend for OCR cleanup (none to skip)",
+        choices=["none", "rules", "ollama", "openrouter", "claude", "mlx"],
+        help="Cleanup backend: rules (local, no LLM), ollama/openrouter/claude/mlx (LLM), none (skip)",
     )
     parser.add_argument(
         "--cleanup-model",
@@ -988,9 +1096,9 @@ def main():
     else:
         if args.cleanup_backend is None:
             parser.error("--cleanup-backend is required when not using --scan-only")
-        if args.cleanup_backend != "none" and args.cleanup_reasoning is None:
+        if args.cleanup_backend not in ("none", "rules") and args.cleanup_reasoning is None:
             parser.error(
-                "--cleanup-reasoning is required when --cleanup-backend is not 'none'"
+                "--cleanup-reasoning is required when --cleanup-backend is an LLM backend"
             )
 
     video_path = args.video
@@ -1056,31 +1164,35 @@ def main():
         smart_merged = before_smart - len(entries)
         if smart_merged:
             print(f"Smart dedup merged {smart_merged} single-frame entries")
-        if args.cleanup_backend != "none":
+        if args.cleanup_backend not in ("none", None):
             # Save raw (pre-cleanup) SRT alongside the final one
             raw_path = os.path.splitext(output_path)[0] + ".raw.srt"
             write_srt(entries, raw_path)
             print(f"Written {len(entries)} raw subtitle entries to {raw_path}")
 
             backend = args.cleanup_backend
-            default_models = {
-                "openrouter": "qwen/qwen3-235b-a22b-2507",
-                "claude": "claude-sonnet-4-6",
-                "ollama": "qwen3:8b-q4_K_M",
-                "mlx": "mlx-community/Qwen3-4B-4bit",
-            }
-            default_model = default_models.get(backend, "qwen3:8b-q4_K_M")
-            cleanup_model = args.cleanup_model or default_model
-            thinking = bool(args.cleanup_reasoning)
-            print(f"Cleaning up OCR artifacts with {cleanup_model} ({backend})...")
-            entries = cleanup_with_llm(
-                entries,
-                model=cleanup_model,
-                languages=args.languages,
-                thinking=thinking,
-                backend=backend,
-                retry=args.retry,
-            )
+            if backend == "rules":
+                print("Cleaning up OCR artifacts with rules-based cleanup...")
+                entries = cleanup_rules(entries, languages=args.languages)
+            else:
+                default_models = {
+                    "openrouter": "qwen/qwen3-235b-a22b-2507",
+                    "claude": "claude-sonnet-4-6",
+                    "ollama": "qwen3:8b-q4_K_M",
+                    "mlx": "mlx-community/Qwen3-4B-4bit",
+                }
+                default_model = default_models.get(backend, "qwen3:8b-q4_K_M")
+                cleanup_model = args.cleanup_model or default_model
+                thinking = bool(args.cleanup_reasoning)
+                print(f"Cleaning up OCR artifacts with {cleanup_model} ({backend})...")
+                entries = cleanup_with_llm(
+                    entries,
+                    model=cleanup_model,
+                    languages=args.languages,
+                    thinking=thinking,
+                    backend=backend,
+                    retry=args.retry,
+                )
             # Fuzzy dedup: merge consecutive near-duplicate entries the LLM missed
             entries = deduplicate(entries, max_dist=2)
             # Ensure every frame in detected clips is covered by a subtitle

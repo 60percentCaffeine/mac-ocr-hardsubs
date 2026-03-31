@@ -276,6 +276,489 @@ def ocr_frame_dotsocr(frame_path, languages, fast):
     return output_text[0].strip() if output_text else ""
 
 
+# ── DotsMOCR 4-bit quantized (GPU) backend ───────────────────────────────
+
+_dots4bit_model = None
+_dots4bit_processor = None
+
+
+def _load_dots4bit():
+    """Load the DotsMOCR model in 4-bit quantization (cached after first call)."""
+    global _dots4bit_model, _dots4bit_processor
+    if _dots4bit_model is not None:
+        return _dots4bit_model, _dots4bit_processor
+
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
+
+    model_id = os.environ.get("DOTSOCR_MODEL", "rednote-hilab/dots.mocr")
+
+    print(f"Loading DotsMOCR 4-bit model ({model_id})...", flush=True)
+
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "sdpa"
+        print("flash-attn not found, using SDPA attention", flush=True)
+
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4",
+    )
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    if hasattr(config, "vision_config") and attn_impl != "flash_attention_2":
+        config.vision_config.attn_implementation = attn_impl
+    _dots4bit_model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        config=config,
+        attn_implementation=attn_impl,
+        quantization_config=quantization_config,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    # Cast vision tower to bfloat16 to match processor output dtype
+    if hasattr(_dots4bit_model, "vision_tower"):
+        _dots4bit_model.vision_tower = _dots4bit_model.vision_tower.to(torch.bfloat16)
+    _dots4bit_processor = AutoProcessor.from_pretrained(
+        model_id, trust_remote_code=True
+    )
+    print("DotsMOCR 4-bit model loaded.", flush=True)
+    return _dots4bit_model, _dots4bit_processor
+
+
+def ocr_batch_dots4bit(frame_paths, languages, fast):
+    """Run DotsMOCR 4-bit OCR on a batch of frames, return list of recognized texts."""
+    from qwen_vl_utils import process_vision_info
+
+    model, processor = _load_dots4bit()
+    prompt = "Extract the text content from this image."
+
+    all_texts = []
+    all_image_inputs = []
+    for frame_path in frame_paths:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": str(frame_path)},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, _ = process_vision_info(messages)
+        all_texts.append(text)
+        all_image_inputs.extend(image_inputs)
+
+    inputs = processor(
+        text=all_texts,
+        images=all_image_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
+
+    import logging
+    logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
+    generated_ids = model.generate(**inputs, max_new_tokens=512)
+
+    results = []
+    for i, in_ids in enumerate(inputs.input_ids):
+        out_ids = generated_ids[i][len(in_ids):]
+        decoded = processor.decode(out_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        results.append(decoded.strip())
+    return results
+
+
+def ocr_frame_dots4bit(frame_path, languages, fast):
+    """Run DotsMOCR 4-bit OCR on a single frame, return recognized text."""
+    results = ocr_batch_dots4bit([frame_path], languages, fast)
+    return results[0] if results else ""
+
+
+DOTS4BIT_BATCH_SIZE = 64
+
+
+# ── Chrome Screen AI backend ─────────────────────────────────────────────
+
+_screenai_engine = None
+
+
+def _load_screenai():
+    """Load the Chrome Screen AI native library (cached after first call).
+
+    Model files must already be present at ~/.config/screen_ai/resources/
+    (call _ensure_screenai_downloaded() first when running in the main process).
+    """
+    global _screenai_engine
+    if _screenai_engine is not None:
+        return _screenai_engine
+
+    import ctypes
+
+    model_dir = Path.home() / ".config" / "screen_ai" / "resources"
+    if not model_dir.exists():
+        raise RuntimeError(
+            "Screen AI model files not found. Run _ensure_screenai_downloaded() first."
+        )
+
+    dll_name = "chrome_screen_ai.dll" if sys.platform == "win32" else "libchromescreenai.so"
+    dll_mode = os.RTLD_LAZY if hasattr(os, "RTLD_LAZY") else ctypes.DEFAULT_MODE
+    lib = ctypes.CDLL(str(model_dir / dll_name), mode=dll_mode)
+
+    # ── ctypes struct definitions (mirrors Skia's SkBitmap) ─────────────
+    class SkColorInfo(ctypes.Structure):
+        _fields_ = [("fColorSpace", ctypes.c_void_p), ("fColorType", ctypes.c_int32), ("fAlphaType", ctypes.c_int32)]
+
+    class SkISize(ctypes.Structure):
+        _fields_ = [("fWidth", ctypes.c_int32), ("fHeight", ctypes.c_int32)]
+
+    class SkImageInfo(ctypes.Structure):
+        _fields_ = [("fColorInfo", SkColorInfo), ("fDimensions", SkISize)]
+
+    class SkPixmap(ctypes.Structure):
+        _fields_ = [("fPixels", ctypes.c_void_p), ("fRowBytes", ctypes.c_size_t), ("fInfo", SkImageInfo)]
+
+    class SkBitmap(ctypes.Structure):
+        _fields_ = [("fPixelRef", ctypes.c_void_p), ("fPixmap", SkPixmap), ("fFlags", ctypes.c_uint32)]
+
+    # ── file-content callbacks (library reads its own weight files) ──────
+    @ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.c_char_p)
+    def get_file_content_size(p):
+        path = model_dir / p.decode("utf-8")
+        return os.path.getsize(path) if path.exists() else 0
+
+    @ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_void_p)
+    def get_file_content(p, s, ptr):
+        path = model_dir / p.decode("utf-8")
+        if path.exists():
+            with open(path, "rb") as f:
+                ctypes.memmove(ptr, f.read(s), s)
+
+    # ── configure function signatures ───────────────────────────────────
+    lib.SetFileContentFunctions.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.InitOCRUsingCallback.restype = ctypes.c_bool
+    lib.SetOCRLightMode.argtypes = [ctypes.c_bool]
+    lib.PerformOCR.argtypes = [ctypes.POINTER(SkBitmap), ctypes.POINTER(ctypes.c_uint32)]
+    lib.PerformOCR.restype = ctypes.c_void_p
+    lib.FreeLibraryAllocatedCharArray.argtypes = [ctypes.c_void_p]
+    lib.GetMaxImageDimension.restype = ctypes.c_uint32
+
+    lib.SetFileContentFunctions(get_file_content_size, get_file_content)
+    lib.InitOCRUsingCallback()
+    lib.SetOCRLightMode(False)
+    max_pixel_size = lib.GetMaxImageDimension()
+
+    _screenai_engine = {
+        "lib": lib,
+        "SkBitmap": SkBitmap,
+        "max_pixel_size": max_pixel_size,
+        # prevent garbage-collection of the callback pointers
+        "_cb_size": get_file_content_size,
+        "_cb_content": get_file_content,
+    }
+    print("Chrome Screen AI loaded.", flush=True)
+    return _screenai_engine
+
+
+def _screenai_ocr_image(engine, img):
+    """Run Screen AI OCR on a PIL Image, return recognized text string."""
+    import ctypes
+    from screenai_protos.chrome_screen_ai_pb2 import VisualAnnotation
+    from google.protobuf.json_format import MessageToDict
+
+    lib = engine["lib"]
+    SkBitmap = engine["SkBitmap"]
+    max_px = engine["max_pixel_size"]
+
+    # down-scale if needed
+    if any(x > max_px for x in img.size):
+        factor = min(max_px / img.width, max_px / img.height)
+        img = img.resize((int(img.width * factor), int(img.height * factor)), 3)  # LANCZOS=3
+
+    img_bytes = img.convert("RGBA").tobytes()
+    w, h = img.size
+
+    bitmap = SkBitmap()
+    bitmap.fPixmap.fPixels = ctypes.cast(ctypes.c_char_p(img_bytes), ctypes.c_void_p)
+    bitmap.fPixmap.fRowBytes = w * 4
+    bitmap.fPixmap.fInfo.fColorInfo.fColorType = 4
+    bitmap.fPixmap.fInfo.fColorInfo.fAlphaType = 1
+    bitmap.fPixmap.fInfo.fDimensions.fWidth = w
+    bitmap.fPixmap.fInfo.fDimensions.fHeight = h
+
+    output_length = ctypes.c_uint32(0)
+    result_ptr = lib.PerformOCR(ctypes.byref(bitmap), ctypes.byref(output_length))
+    if not result_ptr:
+        return ""
+
+    proto_bytes = ctypes.string_at(result_ptr, output_length.value)
+    lib.FreeLibraryAllocatedCharArray(result_ptr)
+
+    annotation = VisualAnnotation()
+    annotation.ParseFromString(proto_bytes)
+    response = MessageToDict(annotation, preserving_proto_field_name=True)
+
+    lines = []
+    for line in response.get("lines", []):
+        text = line.get("utf8_string", "").strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def ocr_frame_screenai(frame_path, languages, fast):
+    """Run Chrome Screen AI OCR on a single frame, return recognized text."""
+    from PIL import Image
+
+    _ensure_screenai_downloaded()
+    engine = _load_screenai()
+    img = Image.open(frame_path)
+    text = _screenai_ocr_image(engine, img)
+    img.close()
+    return text
+
+
+def _screenai_worker_ocr(frame_path):
+    """Worker function: OCR a single frame path, return text.
+
+    Each worker lazily initialises its own Screen AI engine on first call
+    (via the module-level _load_screenai cache).
+    """
+    from PIL import Image
+    # Suppress noisy native-library logging in workers
+    if not getattr(_screenai_worker_ocr, "_stderr_suppressed", False):
+        _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_devnull_fd, 2)
+        _screenai_worker_ocr._stderr_suppressed = True
+    engine = _load_screenai()
+    img = Image.open(frame_path)
+    text = _screenai_ocr_image(engine, img)
+    img.close()
+    return text.strip()
+
+
+def _ensure_screenai_downloaded():
+    """Download Screen AI model files if needed (call before spawning workers)."""
+    import platform
+
+    model_dir = Path.home() / ".config" / "screen_ai" / "resources"
+    if model_dir.exists():
+        return
+
+    print("Downloading Chrome Screen AI model files...", flush=True)
+
+    os_name = platform.system().lower()
+    arch = platform.machine().lower()
+    if os_name == "darwin":
+        os_name = "mac"
+    if arch in ("x86_64", "amd64"):
+        arch = "amd64"
+    elif arch in ("aarch64", "arm64"):
+        arch = "arm64"
+    elif arch in ("x86", "i386", "i686"):
+        arch = "386"
+
+    cipd_platform = "linux" if os_name == "linux" else f"{os_name}-{arch}"
+    package_name = f"chromium/third_party/screen-ai/{cipd_platform}"
+    ensure_content = f"{package_name} latest\n"
+
+    with tempfile.TemporaryDirectory() as td:
+        cipd_bin = "cipd.exe" if sys.platform == "win32" else "cipd"
+        cipd_path = os.path.join(td, cipd_bin)
+        cipd_client_platform = f"{os_name}-{arch}"
+        cipd_url = f"https://chrome-infra-packages.appspot.com/client?platform={cipd_client_platform}&version=latest"
+        try:
+            urllib.request.urlretrieve(cipd_url, cipd_path)
+            if sys.platform != "win32":
+                os.chmod(cipd_path, 0o755)
+        except Exception as exc:
+            sys.exit(f"Error: failed to download CIPD client: {exc}")
+        target_path = model_dir.parent
+        cmd = [cipd_path, "export", "-root", str(target_path), "-ensure-file", "-"]
+        try:
+            subprocess.run(cmd, input=ensure_content, text=True, check=True)
+        except Exception as exc:
+            sys.exit(f"Error: failed to download Screen AI files: {exc}")
+
+    print("Screen AI model files downloaded.", flush=True)
+
+
+def detect_text_frames_screenai(frames, languages, num_workers=None):
+    """OCR frames using Chrome Screen AI with parallel processes for speed.
+
+    Each worker process loads its own copy of the native library to avoid
+    thread-safety issues.  Pre-filtering and frame-differencing reduce the
+    total number of OCR calls.
+    """
+    import numpy as np
+    from multiprocessing import get_context
+
+    if num_workers is None:
+        num_workers = min(os.cpu_count() or 1, 1)
+
+    # Pre-filter: skip frames that clearly have no text
+    print("Pre-filtering frames...", end="", flush=True)
+    candidates = set()
+    frame_arrays = {}
+    for idx, frame in enumerate(frames):
+        arr = _load_frame_gray(frame)
+        frame_arrays[idx] = arr
+        dx = np.abs(np.diff(arr, axis=1))
+        dy = np.abs(np.diff(arr, axis=0))
+        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
+            candidates.add(idx)
+    edge_skipped = len(frames) - len(candidates)
+    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
+
+    # Ensure model files are downloaded before spawning workers
+    _ensure_screenai_downloaded()
+
+    # Build list of frames that need OCR (applying frame differencing)
+    texts = [""] * len(frames)
+    ocr_indices = []
+    diff_reused = 0
+    last_ocr_arr = None
+    for idx in range(len(frames)):
+        if idx not in candidates:
+            last_ocr_arr = None
+        elif last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, frame_arrays[idx]):
+            diff_reused += 1
+        else:
+            ocr_indices.append(idx)
+            last_ocr_arr = frame_arrays[idx]
+
+    if diff_reused:
+        print(f"Frame differencing will reuse OCR for {diff_reused} frames")
+
+    total_ocr = len(ocr_indices)
+    ocr_paths = [str(frames[i]) for i in ocr_indices]
+
+    # Use 'spawn' context so each worker starts fresh (no inherited ctypes state)
+    ctx = get_context("spawn")
+    print(f"OCR: 0% (0/{total_ocr} frames, {num_workers} workers)", end="", flush=True)
+    with ctx.Pool(processes=num_workers) as pool:
+        results = []
+        for i, text in enumerate(pool.imap(_screenai_worker_ocr, ocr_paths)):
+            results.append(text)
+            progress = (i + 1) / total_ocr * 100 if total_ocr else 100
+            print(f"\rOCR: {progress:.0f}% ({i + 1}/{total_ocr} frames, {num_workers} workers)", end="", flush=True)
+
+    for i, idx in enumerate(ocr_indices):
+        texts[idx] = results[i]
+
+    # Propagate OCR results to diff-reused frames
+    ocr_set = set(ocr_indices)
+    last_ocr_text = ""
+    last_ocr_arr = None
+    for idx in range(len(frames)):
+        if idx not in candidates:
+            last_ocr_text = ""
+            last_ocr_arr = None
+        elif idx in ocr_set:
+            last_ocr_text = texts[idx]
+            last_ocr_arr = frame_arrays[idx]
+        else:
+            if last_ocr_arr is not None:
+                texts[idx] = last_ocr_text
+
+    print()
+    if diff_reused:
+        print(f"Frame differencing reused OCR for {diff_reused} frames")
+    frame_arrays.clear()
+    return texts
+
+
+def detect_text_frames_batched(frames, languages, batch_size=DOTS4BIT_BATCH_SIZE):
+    """OCR frames using batched 4-bit DotsMOCR for faster throughput.
+
+    Same pre-filtering as detect_text_frames but collects candidate frames
+    into batches for parallel GPU inference.
+    """
+    import numpy as np
+
+    # Pre-filter: skip frames that clearly have no text
+    print("Pre-filtering frames...", end="", flush=True)
+    candidates = set()
+    frame_arrays = {}
+    for idx, frame in enumerate(frames):
+        arr = _load_frame_gray(frame)
+        frame_arrays[idx] = arr
+        dx = np.abs(np.diff(arr, axis=1))
+        dy = np.abs(np.diff(arr, axis=0))
+        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
+            candidates.add(idx)
+    edge_skipped = len(frames) - len(candidates)
+    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
+
+    # Pre-load the model before starting progress display
+    _load_dots4bit()
+
+    # Build list of frames that need OCR (applying frame differencing)
+    texts = [""] * len(frames)
+    ocr_indices = []  # indices that need actual OCR
+    diff_reused = 0
+    last_ocr_text = ""
+    last_ocr_arr = None
+    for idx in range(len(frames)):
+        if idx not in candidates:
+            last_ocr_text = ""
+            last_ocr_arr = None
+        elif last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, frame_arrays[idx]):
+            texts[idx] = last_ocr_text
+            diff_reused += 1
+            # Don't update last_ocr_arr — keep comparing against the original OCR'd frame
+        else:
+            ocr_indices.append(idx)
+            last_ocr_text = ""  # placeholder, will be filled after batch OCR
+            last_ocr_arr = frame_arrays[idx]
+
+    if diff_reused:
+        print(f"Frame differencing will reuse OCR for {diff_reused} frames")
+
+    # Process OCR indices in batches
+    total_ocr = len(ocr_indices)
+    processed = 0
+    for batch_start in range(0, total_ocr, batch_size):
+        batch_indices = ocr_indices[batch_start : batch_start + batch_size]
+        batch_paths = [frames[i] for i in batch_indices]
+        batch_results = ocr_batch_dots4bit(batch_paths, languages, fast=False)
+        for i, idx in enumerate(batch_indices):
+            texts[idx] = batch_results[i]
+        processed += len(batch_indices)
+        progress = processed / total_ocr * 100 if total_ocr else 100
+        print(f"\rOCR: {progress:.0f}% ({processed}/{total_ocr} frames)", end="", flush=True)
+
+    # Second pass: propagate OCR results to diff-reused frames
+    # (because we didn't know the OCR text at diff-reuse time)
+    ocr_set = set(ocr_indices)
+    last_ocr_text = ""
+    last_ocr_arr = None
+    for idx in range(len(frames)):
+        if idx not in candidates:
+            last_ocr_text = ""
+            last_ocr_arr = None
+        elif idx in ocr_set:
+            # This was an OCR'd frame — update tracking
+            last_ocr_text = texts[idx]
+            last_ocr_arr = frame_arrays[idx]
+        else:
+            # This was a diff-reused frame — use the last OCR text
+            if last_ocr_arr is not None:
+                texts[idx] = last_ocr_text
+
+    print()
+    if diff_reused:
+        print(f"Frame differencing reused OCR for {diff_reused} frames")
+    frame_arrays.clear()
+    return texts
+
+
 def format_timestamp(seconds):
     """Format seconds as SRT timestamp HH:MM:SS,mmm."""
     h = int(seconds // 3600)
@@ -285,16 +768,42 @@ def format_timestamp(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _tokenize_cjk(text):
+    """Split text into tokens: each CJK character is its own token,
+    consecutive non-CJK characters form a single token."""
+    tokens = []
+    buf = []
+    for c in text:
+        if "\u4E00" <= c <= "\u9FFF" or "\uF900" <= c <= "\uFAFF" or "\U00020000" <= c <= "\U0002A6DF":
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+            tokens.append(c)
+        else:
+            buf.append(c)
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
+
 def _edit_distance(a, b):
-    """Compute Levenshtein edit distance between two strings."""
-    if len(a) < len(b):
-        return _edit_distance(b, a)
-    if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a):
+    """Compute Levenshtein edit distance on CJK-aware tokens.
+
+    Each CJK character (Simplified/Traditional) counts as one token.
+    Consecutive non-CJK characters are grouped into a single token.
+    This way 'is正在殺時間' and '正在殺時間' differ by 1 (the 'is' run),
+    but 'is正在殺is時間' and '正在殺時間' differ by 2.
+    """
+    ta = _tokenize_cjk(a)
+    tb = _tokenize_cjk(b)
+    if len(ta) < len(tb):
+        ta, tb = tb, ta
+    if not tb:
+        return len(ta)
+    prev = list(range(len(tb) + 1))
+    for i, ca in enumerate(ta):
         curr = [i + 1]
-        for j, cb in enumerate(b):
+        for j, cb in enumerate(tb):
             curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
         prev = curr
     return prev[-1]
@@ -563,6 +1072,135 @@ def parse_cleanup_response(response_text, batch_entries):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Rules-based cleanup (no LLM)
+# ---------------------------------------------------------------------------
+
+# Characters that legitimately appear in CJK subtitles.  Anything outside
+# this set is considered OCR noise and stripped from each line.
+_SUBTITLE_WHITELIST_RE = re.compile(
+    r"["
+    r"\u0020-\u007E"       # ASCII (letters, digits, basic punctuation)
+    r"\u00C0-\u024F"       # Latin Extended (accented letters)
+    r"\u2000-\u206F"       # General Punctuation (—, –, ', ', ", ", …, etc.)
+    r"\u2150-\u218F"       # Number Forms (fractions)
+    r"\u2190-\u21FF"       # Arrows
+    r"\u22EF"              # ⋯ midline ellipsis
+    r"\u2500-\u257F"       # Box Drawing
+    r"\u3000-\u303F"       # CJK Symbols & Punctuation (　、。〈〉《》「」『』【】〜)
+    r"\u3040-\u309F"       # Hiragana
+    r"\u30A0-\u30FF"       # Katakana
+    r"\u4E00-\u9FFF"       # CJK Unified Ideographs
+    r"\uF900-\uFAFF"       # CJK Compatibility Ideographs
+    r"\uFE30-\uFE4F"       # CJK Compatibility Forms
+    r"\uFF00-\uFFEF"       # Halfwidth & Fullwidth Forms (！＂＃, ０-９, Ａ-Ｚ, etc.)
+    r"\U00020000-\U0002A6DF"  # CJK Unified Ideographs Extension B (rare chars)
+    r"]"
+)
+
+# Hiragana U+3040-309F, Katakana U+30A0-30FF
+_KANA_RE = re.compile(r"[\u3040-\u30FF]")
+
+
+def _is_mostly_kana(text):
+    """Return True if text is predominantly Japanese kana/punctuation."""
+    stripped = re.sub(r"[\s.,!?。、！？…⋯\-()（）「」『』【】]", "", text)
+    if not stripped:
+        return True
+    kana_count = sum(1 for c in stripped if "\u3040" <= c <= "\u30FF")
+    return kana_count / len(stripped) >= 0.5
+
+
+def _strip_non_whitelist(text):
+    """Remove characters not in the subtitle whitelist."""
+    return "".join(c for c in text if _SUBTITLE_WHITELIST_RE.match(c))
+
+
+def _fix_punctuation(text):
+    """Fix common OCR punctuation errors."""
+    # Normalize various ellipsis forms to ⋯
+    text = re.sub(r"\.{2,}", "⋯", text)
+    text = re.sub(r"。{2,}", "⋯", text)
+    text = re.sub(r"…+", "⋯", text)
+    # .0, .00 etc. at end → ⋯  (Screen AI reads ⋯ as .00 sometimes)
+    text = re.sub(r"\.0+$", "⋯", text)
+    # 。0 or trailing 0 at end of sentence → ⋯
+    text = re.sub(r"。0", "⋯", text)
+    # •。 or ·。 or stray dot combinations → ⋯
+    text = re.sub(r"[•·]。", "⋯", text)
+    text = re.sub(r"[•·]{2,}", "⋯", text)
+    # Stray quotes before repeated chars (hesitation pattern)
+    # e.g. 我"我 or 我"。我 → 我⋯我
+    text = re.sub(r'(["\u201C\u201D])([。]?)', lambda m: "⋯", text)
+
+    # Normalize half-width punctuation to full-width in CJK context
+    # Comma: CJK,CJK or CJK, CJK → CJK，CJK
+    text = re.sub(
+        r"(?<=[\u3000-\u9FFF\uF900-\uFAFF\U00020000-\U0002A6DF]),\s?(?=[\u3000-\u9FFF\uF900-\uFAFF\U00020000-\U0002A6DF])",
+        "，",
+        text,
+    )
+    # Parentheses containing CJK → full-width
+    text = re.sub(
+        r"\(([^)]*[\u3000-\u9FFF\uF900-\uFAFF\U00020000-\U0002A6DF][^)]*)\)",
+        r"（\1）",
+        text,
+    )
+    # Strip orphan closing brackets/parens without matching opener
+    text = re.sub(r"^】", "", text)
+    text = re.sub(r"】$", "", text) if "【" not in text else text
+    if "(" not in text:
+        text = text.rstrip(")")
+    return text
+
+
+def _clean_line(line):
+    """Clean a single subtitle line. Returns cleaned line or None to remove."""
+    line = line.strip()
+    if not line:
+        return None
+
+    # Strip characters outside the subtitle whitelist (Arabic, Cyrillic, etc.)
+    line = _strip_non_whitelist(line).strip()
+    if not line:
+        return None
+
+    # Pure kana line → remove
+    if _is_mostly_kana(line):
+        return None
+
+    # Fix punctuation
+    line = _fix_punctuation(line)
+
+    return line if line else None
+
+
+def cleanup_rules(entries, languages=None):
+    """Clean OCR artifacts using deterministic rules. Returns filtered entries."""
+    if not entries:
+        return entries
+
+    if languages is None:
+        languages = ["zh-Hant"]
+
+    result = []
+    for text, start, end in entries:
+        lines = text.split("\n")
+        cleaned_lines = []
+        for line in lines:
+            cleaned = _clean_line(line)
+            if cleaned is not None:
+                cleaned_lines.append(cleaned)
+
+        if not cleaned_lines:
+            continue
+
+        new_text = "\n".join(cleaned_lines)
+        result.append((new_text, start, end))
+
+    return result
+
+
 def cleanup_with_llm(
     entries,
     model="qwen3:8b-q4_K_M",
@@ -719,8 +1357,8 @@ def main():
     parser.add_argument(
         "--scan-backend",
         required=True,
-        choices=["apple", "dotsocr"],
-        help="OCR backend: apple (macOS Vision) or dotsocr (DotsMOCR on GPU/CUDA)",
+        choices=["apple", "dotsocr", "dots4bit", "screenai"],
+        help="OCR backend: apple (macOS Vision), dotsocr (DotsMOCR bf16), dots4bit (DotsMOCR 4-bit quantized + batched), or screenai (Chrome Screen AI)",
     )
     parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt)")
     parser.add_argument(
@@ -740,8 +1378,8 @@ def main():
     parser.add_argument(
         "--cleanup-backend",
         default=None,
-        choices=["none", "ollama", "openrouter", "claude", "mlx"],
-        help="LLM backend for OCR cleanup (none to skip)",
+        choices=["none", "rules", "ollama", "openrouter", "claude", "mlx"],
+        help="Cleanup backend: rules (local, no LLM), ollama/openrouter/claude/mlx (LLM), none (skip)",
     )
     parser.add_argument(
         "--cleanup-model",
@@ -762,6 +1400,18 @@ def main():
         "--retry",
         action="store_true",
         help="Retry endlessly on LLM cleanup errors instead of aborting",
+    )
+    parser.add_argument(
+        "--scan-batch-size",
+        type=int,
+        default=DOTS4BIT_BATCH_SIZE,
+        help=f"Batch size for dots4bit backend (default: {DOTS4BIT_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--scan-threads",
+        type=int,
+        default=None,
+        help="Number of worker threads/processes for screenai backend (default: min(cpu_count, 8))",
     )
     parser.add_argument(
         "--scan-only",
@@ -789,9 +1439,9 @@ def main():
     else:
         if args.cleanup_backend is None:
             parser.error("--cleanup-backend is required when not using --scan-only")
-        if args.cleanup_backend != "none" and args.cleanup_reasoning is None:
+        if args.cleanup_backend not in ("none", "rules") and args.cleanup_reasoning is None:
             parser.error(
-                "--cleanup-reasoning is required when --cleanup-backend is not 'none'"
+                "--cleanup-reasoning is required when --cleanup-backend is an LLM backend"
             )
 
     video_path = args.video
@@ -816,7 +1466,12 @@ def main():
         print(f"Extracted {len(frames)} frames")
 
         # OCR all frames
-        ocr_texts = detect_text_frames(frames, args.languages, scan_backend=args.scan_backend)
+        if args.scan_backend == "dots4bit":
+            ocr_texts = detect_text_frames_batched(frames, args.languages, batch_size=args.scan_batch_size)
+        elif args.scan_backend == "screenai":
+            ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads)
+        else:
+            ocr_texts = detect_text_frames(frames, args.languages, scan_backend=args.scan_backend)
         clips = build_clips(ocr_texts, sample_interval)
         text_frame_count = sum(e - s + 1 for s, e in clips)
         print(
@@ -854,31 +1509,35 @@ def main():
         smart_merged = before_smart - len(entries)
         if smart_merged:
             print(f"Smart dedup merged {smart_merged} single-frame entries")
-        if args.cleanup_backend != "none":
+        if args.cleanup_backend not in ("none", None):
             # Save raw (pre-cleanup) SRT alongside the final one
             raw_path = os.path.splitext(output_path)[0] + ".raw.srt"
             write_srt(entries, raw_path)
             print(f"Written {len(entries)} raw subtitle entries to {raw_path}")
 
             backend = args.cleanup_backend
-            default_models = {
-                "openrouter": "qwen/qwen3-235b-a22b-2507",
-                "claude": "claude-sonnet-4-6",
-                "ollama": "qwen3:8b-q4_K_M",
-                "mlx": "mlx-community/Qwen3-4B-4bit",
-            }
-            default_model = default_models.get(backend, "qwen3:8b-q4_K_M")
-            cleanup_model = args.cleanup_model or default_model
-            thinking = bool(args.cleanup_reasoning)
-            print(f"Cleaning up OCR artifacts with {cleanup_model} ({backend})...")
-            entries = cleanup_with_llm(
-                entries,
-                model=cleanup_model,
-                languages=args.languages,
-                thinking=thinking,
-                backend=backend,
-                retry=args.retry,
-            )
+            if backend == "rules":
+                print("Cleaning up OCR artifacts with rules-based cleanup...")
+                entries = cleanup_rules(entries, languages=args.languages)
+            else:
+                default_models = {
+                    "openrouter": "qwen/qwen3-235b-a22b-2507",
+                    "claude": "claude-sonnet-4-6",
+                    "ollama": "qwen3:8b-q4_K_M",
+                    "mlx": "mlx-community/Qwen3-4B-4bit",
+                }
+                default_model = default_models.get(backend, "qwen3:8b-q4_K_M")
+                cleanup_model = args.cleanup_model or default_model
+                thinking = bool(args.cleanup_reasoning)
+                print(f"Cleaning up OCR artifacts with {cleanup_model} ({backend})...")
+                entries = cleanup_with_llm(
+                    entries,
+                    model=cleanup_model,
+                    languages=args.languages,
+                    thinking=thinking,
+                    backend=backend,
+                    retry=args.retry,
+                )
             # Fuzzy dedup: merge consecutive near-duplicate entries the LLM missed
             entries = deduplicate(entries, max_dist=2)
             # Ensure every frame in detected clips is covered by a subtitle

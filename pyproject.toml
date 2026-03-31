@@ -16,6 +16,7 @@ accelerate = {version = ">=0.30", optional = true}
 torchvision = {version = ">=0.17", optional = true}
 dots-mocr = {git = "https://github.com/rednote-hilab/dots.mocr.git", optional = true}
 mlx-lm = {version = ">=0.22", optional = true}
+pillow = "^12.1.1"
 
 [tool.poetry.extras]
 apple = ["pyobjc-framework-Vision"]

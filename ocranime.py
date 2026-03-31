@@ -466,8 +466,8 @@ def _load_screenai():
     return _screenai_engine
 
 
-def _screenai_ocr_image(engine, img):
-    """Run Screen AI OCR on a PIL Image, return recognized text string."""
+def _screenai_perform_ocr(engine, img):
+    """Run Screen AI OCR on a PIL Image, return parsed protobuf response dict."""
     import ctypes
     from screenai_protos.chrome_screen_ai_pb2 import VisualAnnotation
     from google.protobuf.json_format import MessageToDict
@@ -495,21 +495,110 @@ def _screenai_ocr_image(engine, img):
     output_length = ctypes.c_uint32(0)
     result_ptr = lib.PerformOCR(ctypes.byref(bitmap), ctypes.byref(output_length))
     if not result_ptr:
-        return ""
+        return {}
 
     proto_bytes = ctypes.string_at(result_ptr, output_length.value)
     lib.FreeLibraryAllocatedCharArray(result_ptr)
 
     annotation = VisualAnnotation()
     annotation.ParseFromString(proto_bytes)
-    response = MessageToDict(annotation, preserving_proto_field_name=True)
+    return MessageToDict(annotation, preserving_proto_field_name=True)
 
+
+def _screenai_ocr_image(engine, img):
+    """Run Screen AI OCR on a PIL Image, return recognized text string."""
+    response = _screenai_perform_ocr(engine, img)
     lines = []
     for line in response.get("lines", []):
         text = line.get("utf8_string", "").strip()
         if text:
             lines.append(text)
     return "\n".join(lines)
+
+
+def _screenai_ocr_concat(engine, images):
+    """OCR multiple images in one call by concatenating them vertically.
+
+    Returns a list of text strings, one per input image.  Uses bounding-box
+    Y coordinates from the protobuf response to assign lines to their source
+    frame within the concatenated image.
+
+    If the concatenated height would exceed max_pixel_size, the batch is split
+    into sub-batches that each fit within the limit to avoid quality-destroying
+    downscale.
+    """
+    from PIL import Image
+
+    if not images:
+        return []
+    if len(images) == 1:
+        return [_screenai_ocr_image(engine, images[0])]
+
+    max_px = engine["max_pixel_size"]
+    target_w = images[0].width
+
+    # Normalize widths and collect heights
+    resized = []
+    frame_heights = []
+    for img in images:
+        if img.width != target_w:
+            ratio = target_w / img.width
+            img = img.resize((target_w, int(img.height * ratio)), 3)
+        resized.append(img)
+        frame_heights.append(img.height)
+
+    # Split into sub-batches that fit within max_pixel_size
+    sub_batches = []  # list of (start_idx, end_idx) into resized/frame_heights
+    batch_start = 0
+    batch_h = 0
+    for i, fh in enumerate(frame_heights):
+        if batch_h + fh > max_px and i > batch_start:
+            sub_batches.append((batch_start, i))
+            batch_start = i
+            batch_h = 0
+        batch_h += fh
+    sub_batches.append((batch_start, len(resized)))
+
+    all_results = [""] * len(images)
+    for sb_start, sb_end in sub_batches:
+        sb_images = resized[sb_start:sb_end]
+        sb_heights = frame_heights[sb_start:sb_end]
+
+        if len(sb_images) == 1:
+            all_results[sb_start] = _screenai_ocr_image(engine, sb_images[0])
+            continue
+
+        total_h = sum(sb_heights)
+        concat = Image.new("RGB", (target_w, total_h))
+        y_off = 0
+        boundaries = []
+        for img, fh in zip(sb_images, sb_heights):
+            concat.paste(img, (0, y_off))
+            boundaries.append((y_off, y_off + fh))
+            y_off += fh
+
+        response = _screenai_perform_ocr(engine, concat)
+        concat.close()
+
+        # Assign each line to a frame based on bounding box Y center
+        frame_lines = [[] for _ in sb_images]
+        for line in response.get("lines", []):
+            text = line.get("utf8_string", "").strip()
+            if not text:
+                continue
+            bbox = line.get("bounding_box", {})
+            line_y = bbox.get("y", 0) + bbox.get("height", 0) / 2
+            for fi, (ys, ye) in enumerate(boundaries):
+                if line_y < ye:
+                    frame_lines[fi].append(text)
+                    break
+            else:
+                frame_lines[-1].append(text)
+
+        for i, lines in enumerate(frame_lines):
+            all_results[sb_start + i] = "\n".join(lines)
+
+    return all_results
 
 
 def ocr_frame_screenai(frame_path, languages, fast):
@@ -524,12 +613,14 @@ def ocr_frame_screenai(frame_path, languages, fast):
     return text
 
 
-def _screenai_worker_ocr(frame_path):
-    """Worker function: OCR a single frame path, return text.
+def _screenai_worker_ocr(task):
+    """Worker function: OCR one or more frames, return (indices, texts).
 
-    Each worker lazily initialises its own Screen AI engine on first call
-    (via the module-level _load_screenai cache).
+    Accepts (indices, paths) tuple.  When multiple paths are given the frames
+    are concatenated into a single image for one PerformOCR call, and results
+    are split back by bounding-box Y coordinate.
     """
+    indices, frame_paths = task
     from PIL import Image
     # Suppress noisy native-library logging in workers
     if not getattr(_screenai_worker_ocr, "_stderr_suppressed", False):
@@ -537,10 +628,12 @@ def _screenai_worker_ocr(frame_path):
         os.dup2(_devnull_fd, 2)
         _screenai_worker_ocr._stderr_suppressed = True
     engine = _load_screenai()
-    img = Image.open(frame_path)
-    text = _screenai_ocr_image(engine, img)
-    img.close()
-    return text.strip()
+    images = [Image.open(p) for p in frame_paths]
+    texts = _screenai_ocr_concat(engine, images)
+    for img in images:
+        img.close()
+    return indices, [t.strip() for t in texts]
+
 
 
 def _ensure_screenai_downloaded():
@@ -589,12 +682,27 @@ def _ensure_screenai_downloaded():
     print("Screen AI model files downloaded.", flush=True)
 
 
-def detect_text_frames_screenai(frames, languages, num_workers=None):
+def _screenai_warmup(_=None):
+    """Warm up a worker by loading the Screen AI engine and suppressing stderr."""
+    if not getattr(_screenai_warmup, "_stderr_suppressed", False):
+        _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_devnull_fd, 2)
+        _screenai_warmup._stderr_suppressed = True
+    _load_screenai()
+    return True
+
+
+def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=1):
     """OCR frames using Chrome Screen AI with parallel processes for speed.
 
     Each worker process loads its own copy of the native library to avoid
     thread-safety issues.  Pre-filtering and frame-differencing reduce the
     total number of OCR calls.
+
+    When batch_size > 1, frames are concatenated into single images so each
+    PerformOCR call processes multiple frames at once, reducing native library
+    call overhead.  Workers are started and warmed up in parallel with
+    pre-filtering so the two costly startup phases overlap.
     """
     import numpy as np
     from multiprocessing import get_context
@@ -602,7 +710,16 @@ def detect_text_frames_screenai(frames, languages, num_workers=None):
     if num_workers is None:
         num_workers = min(os.cpu_count() or 1, 1)
 
-    # Pre-filter: skip frames that clearly have no text
+    # Ensure model files are downloaded before spawning workers
+    _ensure_screenai_downloaded()
+
+    # Start worker pool and warm up engines in background while we pre-filter
+    ctx = get_context("spawn")
+    pool = ctx.Pool(processes=num_workers)
+    warmup_results = [pool.apply_async(_screenai_warmup) for _ in range(num_workers)]
+
+    # Pre-filter: skip frames that clearly have no text (runs in main process
+    # concurrently with worker engine loading)
     print("Pre-filtering frames...", end="", flush=True)
     candidates = set()
     frame_arrays = {}
@@ -615,9 +732,6 @@ def detect_text_frames_screenai(frames, languages, num_workers=None):
             candidates.add(idx)
     edge_skipped = len(frames) - len(candidates)
     print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
-
-    # Ensure model files are downloaded before spawning workers
-    _ensure_screenai_downloaded()
 
     # Build list of frames that need OCR (applying frame differencing)
     texts = [""] * len(frames)
@@ -636,21 +750,32 @@ def detect_text_frames_screenai(frames, languages, num_workers=None):
     if diff_reused:
         print(f"Frame differencing will reuse OCR for {diff_reused} frames")
 
+    # Wait for all workers to finish warming up before submitting OCR tasks
+    for r in warmup_results:
+        r.get()
+
     total_ocr = len(ocr_indices)
     ocr_paths = [str(frames[i]) for i in ocr_indices]
 
-    # Use 'spawn' context so each worker starts fresh (no inherited ctypes state)
-    ctx = get_context("spawn")
-    print(f"OCR: 0% (0/{total_ocr} frames, {num_workers} workers)", end="", flush=True)
-    with ctx.Pool(processes=num_workers) as pool:
-        results = []
-        for i, text in enumerate(pool.imap(_screenai_worker_ocr, ocr_paths)):
-            results.append(text)
-            progress = (i + 1) / total_ocr * 100 if total_ocr else 100
-            print(f"\rOCR: {progress:.0f}% ({i + 1}/{total_ocr} frames, {num_workers} workers)", end="", flush=True)
+    # Build tasks: chunk frames into batches for concatenated OCR
+    bs = max(1, batch_size)
+    ocr_tasks = []
+    for i in range(0, total_ocr, bs):
+        chunk_indices = list(range(i, min(i + bs, total_ocr)))
+        chunk_paths = [ocr_paths[j] for j in chunk_indices]
+        ocr_tasks.append((chunk_indices, chunk_paths))
 
-    for i, idx in enumerate(ocr_indices):
-        texts[idx] = results[i]
+    batch_label = f", concat {bs}" if bs > 1 else ""
+    print(f"OCR: 0% (0/{total_ocr} frames, {num_workers} workers{batch_label})", end="", flush=True)
+    done = 0
+    for task_indices, task_texts in pool.imap_unordered(_screenai_worker_ocr, ocr_tasks):
+        for ti, text in zip(task_indices, task_texts):
+            texts[ocr_indices[ti]] = text
+        done += len(task_indices)
+        progress = done / total_ocr * 100 if total_ocr else 100
+        print(f"\rOCR: {progress:.0f}% ({done}/{total_ocr} frames, {num_workers} workers{batch_label})", end="", flush=True)
+    pool.close()
+    pool.join()
 
     # Propagate OCR results to diff-reused frames
     ocr_set = set(ocr_indices)
@@ -809,6 +934,15 @@ def _edit_distance(a, b):
     return prev[-1]
 
 
+def _strip_outer_parens(text):
+    """Strip outer full-width or half-width parentheses for comparison."""
+    if (text.startswith("（") and text.endswith("）")) or (
+        text.startswith("(") and text.endswith(")")
+    ):
+        return text[1:-1]
+    return text
+
+
 def deduplicate(entries, max_dist=0):
     """Merge consecutive entries with identical (or near-identical) text."""
     if not entries:
@@ -818,10 +952,21 @@ def deduplicate(entries, max_dist=0):
     current_text, current_start, current_end = entries[0]
 
     for text, start, end in entries[1:]:
-        if text == current_text or (
-            max_dist > 0 and _edit_distance(text, current_text) <= max_dist
-        ):
+        if text == current_text:
             current_end = end
+        elif max_dist > 0:
+            # Compare with outer parentheses stripped so e.g.
+            # "ひ在殺時間" vs "（正在殺時間）" can merge (distance on inner text)
+            a = _strip_outer_parens(current_text)
+            b = _strip_outer_parens(text)
+            if _edit_distance(a, b) <= max_dist:
+                # Keep the longer (likely more accurate) text
+                if len(text) > len(current_text):
+                    current_text = text
+                current_end = end
+            else:
+                merged.append((current_text, current_start, current_end))
+                current_text, current_start, current_end = text, start, end
         else:
             merged.append((current_text, current_start, current_end))
             current_text, current_start, current_end = text, start, end
@@ -1469,7 +1614,7 @@ def main():
         if args.scan_backend == "dots4bit":
             ocr_texts = detect_text_frames_batched(frames, args.languages, batch_size=args.scan_batch_size)
         elif args.scan_backend == "screenai":
-            ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads)
+            ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=args.scan_batch_size)
         else:
             ocr_texts = detect_text_frames(frames, args.languages, scan_backend=args.scan_backend)
         clips = build_clips(ocr_texts, sample_interval)

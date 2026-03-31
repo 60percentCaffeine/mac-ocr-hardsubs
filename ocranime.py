@@ -20,6 +20,7 @@ load_dotenv()
 
 
 MIN_CLIP_DURATION = 0.5  # seconds — clips shorter than this are dropped
+MAX_SUBTITLE_DURATION = 7.0  # seconds — subtitles longer than this are capped
 
 
 def extract_frames(video_path, tmpdir, crop, fps):
@@ -973,12 +974,21 @@ def _edit_distance(a, b):
     return prev[-1]
 
 
+_OUTER_BRACKET_PAIRS = [
+    ("（", "）"), ("(", ")"),
+    ("【", "】"), ("《", "》"),
+    ("「", "」"), ("『", "』"),
+    ("〈", "〉"), ("＜", "＞"),
+    ("〔", "〕"), ("｛", "｝"),
+    ("﹁", "﹂"), ("﹃", "﹄"),
+]
+
+
 def _strip_outer_parens(text):
-    """Strip outer full-width or half-width parentheses for comparison."""
-    if (text.startswith("（") and text.endswith("）")) or (
-        text.startswith("(") and text.endswith(")")
-    ):
-        return text[1:-1]
+    """Strip outer brackets/parentheses for comparison."""
+    for opener, closer in _OUTER_BRACKET_PAIRS:
+        if text.startswith(opener) and text.endswith(closer):
+            return text[1:-1]
     return text
 
 
@@ -1306,16 +1316,35 @@ def _fix_punctuation(text):
     text = re.sub(r"\.{2,}", "⋯", text)
     text = re.sub(r"。{2,}", "⋯", text)
     text = re.sub(r"…+", "⋯", text)
-    # .0, .00 etc. at end → ⋯  (Screen AI reads ⋯ as .00 sometimes)
-    text = re.sub(r"\.0+$", "⋯", text)
+    # .0, .00, …00 etc. at end → ⋯  (Screen AI reads ⋯ as .00 sometimes)
+    text = re.sub(r"[.…⋯]0+$", "⋯", text)
     # 。0 or trailing 0 at end of sentence → ⋯
     text = re.sub(r"。0", "⋯", text)
     # •。 or ·。 or stray dot combinations → ⋯
     text = re.sub(r"[•·]。", "⋯", text)
     text = re.sub(r"[•·]{2,}", "⋯", text)
-    # Stray quotes before repeated chars (hesitation pattern)
-    # e.g. 我"我 or 我"。我 → 我⋯我
-    text = re.sub(r'(["\u201C\u201D])([。]?)', lambda m: "⋯", text)
+    # Strip trailing punctuation after ⋯ (e.g. ⋯。 ⋯. ⋯, → ⋯)
+    text = re.sub(r"⋯[.。,，、;；!！?？]+", "⋯", text)
+    # Normalize curly quotes: treat any pair of U+201C/U+201D (in any combo)
+    # as matched quotes — OCR often uses the same codepoint for both.
+    curly_count = text.count("\u201C") + text.count("\u201D")
+    if curly_count == 2:
+        # Matched pair — normalize first to U+201C, second to U+201D
+        first = True
+        chars = []
+        for c in text:
+            if c in "\u201C\u201D":
+                chars.append("\u201C" if first else "\u201D")
+                first = False
+            else:
+                chars.append(c)
+        text = "".join(chars)
+    elif curly_count == 1:
+        # Stray single curly quote as hesitation marker → ⋯
+        text = text.replace("\u201C", "⋯").replace("\u201D", "⋯")
+    # Stray single straight quote as hesitation marker (e.g. 我"我 → 我⋯我)
+    if text.count('"') == 1:
+        text = text.replace('"', "⋯")
 
     # Normalize half-width punctuation to full-width in CJK context
     # Comma: CJK,CJK or CJK, CJK → CJK，CJK
@@ -1330,11 +1359,24 @@ def _fix_punctuation(text):
         r"（\1）",
         text,
     )
-    # Strip orphan closing brackets/parens without matching opener
-    text = re.sub(r"^】", "", text)
-    text = re.sub(r"】$", "", text) if "【" not in text else text
-    if "(" not in text:
-        text = text.rstrip(")")
+    # Straight quotes containing CJK → fullwidth quotes
+    text = re.sub(
+        r"\"([^\"]*[\u3000-\u9FFF\uF900-\uFAFF\U00020000-\U0002A6DF][^\"]*?)\"",
+        r"「\1」",
+        text,
+    )
+    # Curly quotes containing CJK → fullwidth quotes
+    text = re.sub(
+        r"\u201C([^\u201D]*[\u3000-\u9FFF\uF900-\uFAFF\U00020000-\U0002A6DF][^\u201D]*?)\u201D",
+        r"「\1」",
+        text,
+    )
+    # Strip orphan brackets/parens without matching counterpart
+    for opener, closer in _OUTER_BRACKET_PAIRS:
+        if closer in text and opener not in text:
+            text = text.replace(closer, "")
+        if opener in text and closer not in text:
+            text = text.replace(opener, "")
     return text
 
 
@@ -1519,8 +1561,19 @@ def fill_clip_gaps(entries, clips, sample_interval):
             if best is not None:
                 text, start, end = result[best]
                 new_end = round(t + sample_interval, 6)
-                result[best] = (text, start, new_end)
+                if new_end - start <= MAX_SUBTITLE_DURATION:
+                    result[best] = (text, start, new_end)
 
+    return result
+
+
+def cap_durations(entries, max_duration=MAX_SUBTITLE_DURATION):
+    """Clamp subtitle durations to a maximum length."""
+    result = []
+    for text, start, end in entries:
+        if end - start > max_duration:
+            end = start + max_duration
+        result.append((text, start, end))
     return result
 
 
@@ -1724,6 +1777,7 @@ def main():
                 )
             # Fuzzy dedup: merge consecutive near-duplicate entries the LLM missed
             entries = deduplicate(entries, max_dist=2)
+            entries = cap_durations(entries)
             # Ensure every frame in detected clips is covered by a subtitle
             entries = fill_clip_gaps(entries, clips, sample_interval)
         write_srt(entries, output_path)

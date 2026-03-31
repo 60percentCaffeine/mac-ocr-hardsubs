@@ -600,7 +600,7 @@ def detect_text_frames_screenai(frames, languages, num_workers=None):
     from multiprocessing import get_context
 
     if num_workers is None:
-        num_workers = min(os.cpu_count() or 4, 8)
+        num_workers = min(os.cpu_count() or 1, 1)
 
     # Pre-filter: skip frames that clearly have no text
     print("Pre-filtering frames...", end="", flush=True)
@@ -1408,6 +1408,12 @@ def main():
         help=f"Batch size for dots4bit backend (default: {DOTS4BIT_BATCH_SIZE})",
     )
     parser.add_argument(
+        "--scan-threads",
+        type=int,
+        default=None,
+        help="Number of worker threads/processes for screenai backend (default: min(cpu_count, 8))",
+    )
+    parser.add_argument(
         "--scan-only",
         action="store_true",
         help="Only generate subtitle frame PNGs in scanned_frames/, skip SRT generation",
@@ -1463,7 +1469,7 @@ def main():
         if args.scan_backend == "dots4bit":
             ocr_texts = detect_text_frames_batched(frames, args.languages, batch_size=args.scan_batch_size)
         elif args.scan_backend == "screenai":
-            ocr_texts = detect_text_frames_screenai(frames, args.languages)
+            ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads)
         else:
             ocr_texts = detect_text_frames(frames, args.languages, scan_backend=args.scan_backend)
         clips = build_clips(ocr_texts, sample_interval)

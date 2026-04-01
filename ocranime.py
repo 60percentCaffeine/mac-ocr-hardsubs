@@ -1167,14 +1167,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract hardsubs from anime video to SRT"
     )
-    parser.add_argument("video", help="Input video file path")
+    parser.add_argument("video", nargs="+", help="Input video file path(s)")
     parser.add_argument(
         "--scan-backend",
         default="screenai",
         choices=["apple", "screenai"],
         help="OCR backend: apple (macOS Vision) or screenai (Chrome Screen AI) (default: screenai)",
     )
-    parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt)")
+    parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt), or output folder when processing multiple files")
     parser.add_argument(
         "--crop",
         default="iw*0.7:ih*0.15:iw*0.15:ih*0.8",
@@ -1225,85 +1225,100 @@ def main():
                 f"--scan-only is incompatible with: {', '.join(scan_only_incompatible)}"
             )
 
-    video_path = args.video
-    if not os.path.isfile(video_path):
-        print(f"Error: video file not found: {video_path}", file=sys.stderr)
-        sys.exit(1)
+    multi = len(args.video) > 1
+    if multi and args.output is not None and not os.path.isdir(args.output):
+        os.makedirs(args.output, exist_ok=True)
 
-    output_path = args.output or (os.path.splitext(video_path)[0] + ".srt")
+    # Validate all video files exist before starting
+    for video_path in args.video:
+        if not os.path.isfile(video_path):
+            print(f"Error: video file not found: {video_path}", file=sys.stderr)
+            sys.exit(1)
 
-    # Prepare scanned_frames directory (empty it on each run)
-    scanned_dir = Path("scanned_frames")
-    if scanned_dir.exists():
-        shutil.rmtree(scanned_dir)
-    scanned_dir.mkdir()
+    for file_idx, video_path in enumerate(args.video):
+        if multi:
+            print(f"\n{'='*60}")
+            print(f"[{file_idx + 1}/{len(args.video)}] {video_path}")
+            print(f"{'='*60}")
 
-    fps = args.fps
-    sample_interval = 1.0 / fps
+        if multi and args.output is not None:
+            basename = os.path.splitext(os.path.basename(video_path))[0] + ".srt"
+            output_path = os.path.join(args.output, basename)
+        else:
+            output_path = args.output or (os.path.splitext(video_path)[0] + ".srt")
 
-    with tempfile.TemporaryDirectory(prefix="ocranime_") as tmpdir:
-        print(f"Extracting frames ({fps} fps)...")
-        frames = extract_frames(video_path, tmpdir, args.crop, fps)
-        print(f"Extracted {len(frames)} frames")
+        # Prepare scanned_frames directory (empty it on each run)
+        scanned_dir = Path("scanned_frames")
+        if scanned_dir.exists():
+            shutil.rmtree(scanned_dir)
+        scanned_dir.mkdir()
 
-        # OCR all frames
-        batch_size = args.scan_batch_size
-        if args.scan_backend == "screenai":
-            ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=batch_size or 64)
-        elif args.scan_backend == "apple":
-            ocr_texts = detect_text_frames_apple(frames, args.languages, num_workers=args.scan_threads, **({"batch_size": batch_size} if batch_size is not None else {}))
-        clips = build_clips(ocr_texts, sample_interval)
-        text_frame_count = sum(e - s + 1 for s, e in clips)
-        print(
-            f"Found {len(clips)} subtitle clips ({text_frame_count} frames with text)"
-        )
+        fps = args.fps
+        sample_interval = 1.0 / fps
 
-        # Copy clip frames to scanned_frames/ with timestamp names
-        for s, e in clips:
-            for idx in range(s, e + 1):
-                timestamp = idx * sample_interval
-                h = int(timestamp // 3600)
-                m = int((timestamp % 3600) // 60)
-                s_sec = int(timestamp % 60)
-                ms = int(round((timestamp - int(timestamp)) * 1000))
-                dest = scanned_dir / f"{h:02d}-{m:02d}-{s_sec:02d}-{ms:03d}.png"
-                shutil.copy2(frames[idx], dest)
-        print(f"Saved {text_frame_count} frame PNGs to {scanned_dir}/")
+        with tempfile.TemporaryDirectory(prefix="ocranime_") as tmpdir:
+            print(f"Extracting frames ({fps} fps)...")
+            frames = extract_frames(video_path, tmpdir, args.crop, fps)
+            print(f"Extracted {len(frames)} frames")
 
-        if args.scan_only:
-            print("Scan-only mode: skipping SRT generation.")
-            return
+            # OCR all frames
+            batch_size = args.scan_batch_size
+            if args.scan_backend == "screenai":
+                ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=batch_size or 64)
+            elif args.scan_backend == "apple":
+                ocr_texts = detect_text_frames_apple(frames, args.languages, num_workers=args.scan_threads, **({"batch_size": batch_size} if batch_size is not None else {}))
+            clips = build_clips(ocr_texts, sample_interval)
+            text_frame_count = sum(e - s + 1 for s, e in clips)
+            print(
+                f"Found {len(clips)} subtitle clips ({text_frame_count} frames with text)"
+            )
 
-        # Build entries from OCR results within detected clips
-        raw_entries = []
-        for s, e in clips:
-            for idx in range(s, e + 1):
-                timestamp = idx * sample_interval
-                text = ocr_texts[idx]
-                if text:
-                    raw_entries.append((text, timestamp, timestamp + sample_interval))
+            # Copy clip frames to scanned_frames/ with timestamp names
+            for s, e in clips:
+                for idx in range(s, e + 1):
+                    timestamp = idx * sample_interval
+                    h = int(timestamp // 3600)
+                    m = int((timestamp % 3600) // 60)
+                    s_sec = int(timestamp % 60)
+                    ms = int(round((timestamp - int(timestamp)) * 1000))
+                    dest = scanned_dir / f"{h:02d}-{m:02d}-{s_sec:02d}-{ms:03d}.png"
+                    shutil.copy2(frames[idx], dest)
+            print(f"Saved {text_frame_count} frame PNGs to {scanned_dir}/")
 
-        entries = deduplicate(raw_entries)
-        before_smart = len(entries)
-        entries = smart_deduplicate(entries, sample_interval)
-        smart_merged = before_smart - len(entries)
-        if smart_merged:
-            print(f"Smart dedup merged {smart_merged} single-frame entries")
-        if args.cleanup_backend == "rules":
-            # Save raw (pre-cleanup) SRT alongside the final one
-            raw_path = os.path.splitext(output_path)[0] + ".raw.srt"
-            write_srt(entries, raw_path)
-            print(f"Written {len(entries)} raw subtitle entries to {raw_path}")
+            if args.scan_only:
+                print("Scan-only mode: skipping SRT generation.")
+                continue
 
-            print("Cleaning up OCR artifacts with rules-based cleanup...")
-            entries = cleanup_rules(entries, languages=args.languages)
-            # Fuzzy dedup: merge consecutive near-duplicate entries the cleanup missed
-            entries = deduplicate(entries, max_dist=2)
-            entries = cap_durations(entries)
-            # Ensure every frame in detected clips is covered by a subtitle
-            entries = fill_clip_gaps(entries, clips, sample_interval)
-        write_srt(entries, output_path)
-        print(f"Written {len(entries)} subtitle entries to {output_path}")
+            # Build entries from OCR results within detected clips
+            raw_entries = []
+            for s, e in clips:
+                for idx in range(s, e + 1):
+                    timestamp = idx * sample_interval
+                    text = ocr_texts[idx]
+                    if text:
+                        raw_entries.append((text, timestamp, timestamp + sample_interval))
+
+            entries = deduplicate(raw_entries)
+            before_smart = len(entries)
+            entries = smart_deduplicate(entries, sample_interval)
+            smart_merged = before_smart - len(entries)
+            if smart_merged:
+                print(f"Smart dedup merged {smart_merged} single-frame entries")
+            if args.cleanup_backend == "rules":
+                # Save raw (pre-cleanup) SRT alongside the final one
+                raw_path = os.path.splitext(output_path)[0] + ".raw.srt"
+                write_srt(entries, raw_path)
+                print(f"Written {len(entries)} raw subtitle entries to {raw_path}")
+
+                print("Cleaning up OCR artifacts with rules-based cleanup...")
+                entries = cleanup_rules(entries, languages=args.languages)
+                # Fuzzy dedup: merge consecutive near-duplicate entries the cleanup missed
+                entries = deduplicate(entries, max_dist=2)
+                entries = cap_durations(entries)
+                # Ensure every frame in detected clips is covered by a subtitle
+                entries = fill_clip_gaps(entries, clips, sample_interval)
+            write_srt(entries, output_path)
+            print(f"Written {len(entries)} subtitle entries to {output_path}")
 
 
 if __name__ == "__main__":

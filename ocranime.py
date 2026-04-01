@@ -443,14 +443,52 @@ def _screenai_perform_ocr(engine, img):
     return MessageToDict(annotation, preserving_proto_field_name=True)
 
 
+def _filter_small_lines(response_lines, min_height_ratio=0.5):
+    """Filter out OCR lines whose bounding box height is much smaller than the median.
+
+    Small text (watermarks, logos, UI noise) tends to have significantly shorter
+    bounding box height than actual subtitle text.  Lines with height below
+    ``min_height_ratio`` of the median height are dropped.
+
+    Returns a list of (text, bbox_dict) tuples for lines that pass the filter.
+    """
+    parsed = []
+    for line in response_lines:
+        text = line.get("utf8_string", "").strip()
+        if not text:
+            continue
+        bbox = line.get("bounding_box", {})
+        parsed.append((text, bbox))
+
+    if len(parsed) <= 1:
+        # With only one line, fall back to an absolute check: if the line
+        # height is less than 2% of the image it came from, treat it as noise.
+        # Callers needing the absolute check should use _filter_small_lines_abs.
+        return parsed
+
+    heights = [bbox.get("height", 0) for _, bbox in parsed]
+    sorted_h = sorted(heights)
+    median_h = sorted_h[len(sorted_h) // 2]
+    if median_h <= 0:
+        return parsed
+
+    threshold = median_h * min_height_ratio
+    return [(text, bbox) for text, bbox in parsed if bbox.get("height", 0) >= threshold]
+
+
 def _screenai_ocr_image(engine, img):
     """Run Screen AI OCR on a PIL Image, return recognized text string."""
     response = _screenai_perform_ocr(engine, img)
+    img_h = img.height
+    filtered = _filter_small_lines(response.get("lines", []))
+    # For single-frame images, also apply absolute height filter:
+    # lines shorter than 2% of the image height are likely noise.
     lines = []
-    for line in response.get("lines", []):
-        text = line.get("utf8_string", "").strip()
-        if text:
-            lines.append(text)
+    for text, bbox in filtered:
+        h = bbox.get("height", 0)
+        if img_h > 0 and h > 0 and h < img_h * 0.02:
+            continue
+        lines.append(text)
     return "\n".join(lines)
 
 
@@ -518,13 +556,10 @@ def _screenai_ocr_concat(engine, images):
         response = _screenai_perform_ocr(engine, concat)
         concat.close()
 
-        # Assign each line to a frame based on bounding box Y center
+        # Filter out small noise lines, then assign to frames by Y center
+        filtered = _filter_small_lines(response.get("lines", []))
         frame_lines = [[] for _ in sb_images]
-        for line in response.get("lines", []):
-            text = line.get("utf8_string", "").strip()
-            if not text:
-                continue
-            bbox = line.get("bounding_box", {})
+        for text, bbox in filtered:
             line_y = bbox.get("y", 0) + bbox.get("height", 0) / 2
             for fi, (ys, ye) in enumerate(boundaries):
                 if line_y < ye:

@@ -18,8 +18,8 @@ dots-mocr = {git = "https://github.com/rednote-hilab/dots.mocr.git", optional = 
 bitsandbytes = {version = ">=0.43", optional = true}
 mlx-lm = {version = ">=0.22", optional = true}
 pillow = "^12.1.1"
-protobuf = {version = ">=5.0", optional = true}
-grpcio-tools = {version = ">=1.60", optional = true}
+protobuf = {version = ">=5.0"}
+grpcio-tools = "^1.80.0"
 
 [tool.poetry.extras]
 apple = ["pyobjc-framework-Vision"]

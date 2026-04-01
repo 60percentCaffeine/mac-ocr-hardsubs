@@ -26,7 +26,6 @@ numpy = "^2.4.4"
 apple = ["pyobjc-framework-Vision"]
 dotsocr = ["torch", "transformers", "qwen-vl-utils", "accelerate", "torchvision", "dots-mocr", "flash-attn"]
 dots4bit = ["torch", "transformers", "qwen-vl-utils", "accelerate", "torchvision", "dots-mocr", "bitsandbytes"]
-screenai = ["protobuf", "grpcio-tools"]
 mlx = ["mlx-lm"]
 
 [tool.poetry.scripts]

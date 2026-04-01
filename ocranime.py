@@ -186,11 +186,99 @@ def ocr_frame_apple(frame_path, languages, fast):
     return "\n".join(lines)
 
 
+def _apple_ocr_concat(frame_paths, languages):
+    """OCR multiple frames in one Vision call by concatenating vertically.
+
+    Returns a list of text strings, one per input frame.  Uses bounding-box
+    Y coordinates to assign lines back to their source frame.  Vision uses
+    normalised coordinates with Y=0 at the bottom, so we invert when mapping.
+    """
+    import Vision
+    from Foundation import NSData
+    from PIL import Image
+    import io
+
+    if not frame_paths:
+        return []
+    if len(frame_paths) == 1:
+        return [ocr_frame_apple(frame_paths[0], languages, fast=False).strip()]
+
+    # Load and normalize widths
+    images = [Image.open(p) for p in frame_paths]
+    target_w = images[0].width
+    resized = []
+    frame_heights = []
+    for img in images:
+        if img.width != target_w:
+            ratio = target_w / img.width
+            img = img.resize((target_w, int(img.height * ratio)), Image.LANCZOS)
+        resized.append(img)
+        frame_heights.append(img.height)
+
+    separator_h = 20  # black bar between frames to prevent text bleeding
+    total_h = sum(frame_heights) + separator_h * (len(resized) - 1)
+    concat = Image.new("RGB", (target_w, total_h))  # black by default
+    y_off = 0
+    boundaries = []
+    for img, fh in zip(resized, frame_heights):
+        concat.paste(img, (0, y_off))
+        boundaries.append((y_off, y_off + fh))
+        y_off += fh + separator_h
+    for img in images:
+        img.close()
+
+    # Convert concat to PNG bytes in memory for Vision
+    buf = io.BytesIO()
+    concat.save(buf, format="PNG")
+    concat.close()
+    png_bytes = buf.getvalue()
+
+    data = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
+    if data is None:
+        return [""] * len(frame_paths)
+
+    handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(data, None)
+    request = Vision.VNRecognizeTextRequest.alloc().init()
+    request.setRecognitionLevel_(0)
+    request.setRecognitionLanguages_(languages)
+    handler.performRequests_error_([request], None)
+
+    results = request.results()
+    if not results:
+        return [""] * len(frame_paths)
+
+    # Assign each observation to a frame based on bounding box Y
+    frame_lines = [[] for _ in frame_paths]
+    for obs in results:
+        candidate = obs.topCandidates_(1)
+        if not candidate:
+            continue
+        text = candidate[0].string()
+        if not text.strip():
+            continue
+        bbox = obs.boundingBox()
+        # Vision Y=0 is bottom; convert to pixel Y from top
+        center_y_norm = 1.0 - (bbox.origin.y + bbox.size.height / 2)
+        center_y_px = center_y_norm * total_h
+        for fi, (ys, ye) in enumerate(boundaries):
+            if center_y_px < ye:
+                frame_lines[fi].append(text)
+                break
+        else:
+            frame_lines[-1].append(text)
+
+    return ["\n".join(lines) for lines in frame_lines]
+
+
 def _apple_worker_ocr(task):
-    """Worker function: OCR one frame with Apple Vision, return (task_idx, text)."""
-    task_idx, frame_path, languages = task
-    text = ocr_frame_apple(frame_path, languages, fast=False).strip()
-    return task_idx, text
+    """Worker function: OCR one or more frames with Apple Vision.
+
+    Accepts (chunk_indices, paths, languages).  When multiple paths are given
+    the frames are concatenated into a single image for one OCR call.
+    """
+    chunk_indices, frame_paths, languages = task
+    texts = _apple_ocr_concat(frame_paths, languages)
+    return chunk_indices, [t.strip() for t in texts]
 
 
 def _apple_warmup(languages):
@@ -199,18 +287,21 @@ def _apple_warmup(languages):
     return True
 
 
-def detect_text_frames_apple(frames, languages, num_workers=None):
+def detect_text_frames_apple(frames, languages, num_workers=None, batch_size=16):
     """OCR frames using Apple Vision with parallel processes for speed.
 
     Uses multiprocessing (spawn) so each worker gets its own Vision
     framework instance with full CPU parallelism.  Workers warm up
     while the main process pre-filters frames.
+
+    When batch_size > 1, frames are concatenated into single images so
+    each Vision call processes multiple frames at once.
     """
     import numpy as np
     from multiprocessing import get_context
 
     if num_workers is None:
-        num_workers = min(os.cpu_count() or 1, 1)
+        num_workers = max(os.cpu_count() or 1, 1)
 
     # Start worker pool and warm up in background while we pre-filter
     ctx = get_context("spawn")
@@ -253,15 +344,25 @@ def detect_text_frames_apple(frames, languages, num_workers=None):
         r.get()
 
     total_ocr = len(ocr_indices)
-    ocr_tasks = [(i, str(frames[ocr_indices[i]]), languages) for i in range(total_ocr)]
+    ocr_paths = [str(frames[i]) for i in ocr_indices]
 
-    print(f"OCR: 0% (0/{total_ocr} frames, {num_workers} workers)", end="", flush=True)
+    # Build tasks: chunk frames into batches for concatenated OCR
+    bs = max(1, batch_size)
+    ocr_tasks = []
+    for i in range(0, total_ocr, bs):
+        chunk_indices = list(range(i, min(i + bs, total_ocr)))
+        chunk_paths = [ocr_paths[j] for j in chunk_indices]
+        ocr_tasks.append((chunk_indices, chunk_paths, languages))
+
+    batch_label = f", concat {bs}" if bs > 1 else ""
+    print(f"OCR: 0% (0/{total_ocr} frames, {num_workers} workers{batch_label})", end="", flush=True)
     done = 0
-    for task_idx, text in pool.imap_unordered(_apple_worker_ocr, ocr_tasks):
-        texts[ocr_indices[task_idx]] = text
-        done += 1
+    for chunk_indices, chunk_texts in pool.imap_unordered(_apple_worker_ocr, ocr_tasks):
+        for ci, text in zip(chunk_indices, chunk_texts):
+            texts[ocr_indices[ci]] = text
+        done += len(chunk_indices)
         progress = done / total_ocr * 100 if total_ocr else 100
-        print(f"\rOCR: {progress:.0f}% ({done}/{total_ocr} frames, {num_workers} workers)", end="", flush=True)
+        print(f"\rOCR: {progress:.0f}% ({done}/{total_ocr} frames, {num_workers} workers{batch_label})", end="", flush=True)
     pool.close()
     pool.join()
 
@@ -849,7 +950,7 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
     from multiprocessing import get_context
 
     if num_workers is None:
-        num_workers = min(os.cpu_count() or 1, 1)
+        num_workers = max(os.cpu_count() or 1, 1)
 
     # Ensure model files are downloaded before spawning workers
     _ensure_screenai_downloaded()
@@ -1742,8 +1843,8 @@ def main():
     parser.add_argument(
         "--scan-batch-size",
         type=int,
-        default=DOTS4BIT_BATCH_SIZE,
-        help=f"Batch size for dots4bit backend (default: {DOTS4BIT_BATCH_SIZE})",
+        default=None,
+        help="Batch size for apple/dots4bit/screenai backends (default: 16 for apple, 64 for dots4bit and screenai)",
     )
     parser.add_argument(
         "--scan-threads",
@@ -1804,12 +1905,13 @@ def main():
         print(f"Extracted {len(frames)} frames")
 
         # OCR all frames
+        batch_size = args.scan_batch_size
         if args.scan_backend == "dots4bit":
-            ocr_texts = detect_text_frames_batched(frames, args.languages, batch_size=args.scan_batch_size)
+            ocr_texts = detect_text_frames_batched(frames, args.languages, batch_size=batch_size or DOTS4BIT_BATCH_SIZE)
         elif args.scan_backend == "screenai":
-            ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=args.scan_batch_size)
+            ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=batch_size or 64)
         elif args.scan_backend == "apple":
-            ocr_texts = detect_text_frames_apple(frames, args.languages, num_workers=args.scan_threads)
+            ocr_texts = detect_text_frames_apple(frames, args.languages, num_workers=args.scan_threads, **({"batch_size": batch_size} if batch_size is not None else {}))
         else:
             ocr_texts = detect_text_frames(frames, args.languages, scan_backend=args.scan_backend)
         clips = build_clips(ocr_texts, sample_interval)

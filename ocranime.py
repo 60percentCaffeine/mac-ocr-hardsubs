@@ -443,11 +443,9 @@ def _screenai_perform_ocr(engine, img):
     return MessageToDict(annotation, preserving_proto_field_name=True)
 
 
-# Minimum line bounding-box height as a fraction of the source frame height.
-# Lines shorter than this are treated as UI noise (watermarks, usernames,
-# timestamps, etc.).  Subtitle text is typically ≥ 29% of the cropped frame
-# height; noise text is typically ≤ 26%.
-_MIN_LINE_HEIGHT_FRAC = 0.27
+# Lines shorter than this fraction of the median line height across a batch
+# are treated as UI noise (watermarks, usernames, timestamps, etc.).
+_BBOX_HEIGHT_RATIO = 0.75
 
 
 def _parse_response_lines(response_lines):
@@ -462,15 +460,32 @@ def _parse_response_lines(response_lines):
     return parsed
 
 
+def _compute_min_line_height(all_heights):
+    """Compute minimum line height threshold from observed bbox heights.
+
+    Since most OCR lines are subtitles (consistent height), the median height
+    represents the subtitle size.  Returns a threshold below which lines are
+    considered noise.  Returns 0 if there aren't enough lines to decide.
+    """
+    if len(all_heights) < 2:
+        return 0
+    sorted_h = sorted(all_heights)
+    median_h = sorted_h[len(sorted_h) // 2]
+    if median_h <= 0:
+        return 0
+    return median_h * _BBOX_HEIGHT_RATIO
+
+
 def _screenai_ocr_image(engine, img):
     """Run Screen AI OCR on a PIL Image, return recognized text string."""
     response = _screenai_perform_ocr(engine, img)
-    img_h = img.height
-    min_h = img_h * _MIN_LINE_HEIGHT_FRAC
+    parsed = _parse_response_lines(response.get("lines", []))
+    heights = [bbox.get("height", 0) for _, bbox in parsed]
+    min_h = _compute_min_line_height(heights)
     lines = []
-    for text, bbox in _parse_response_lines(response.get("lines", [])):
+    for text, bbox in parsed:
         h = bbox.get("height", 0)
-        if h > 0 and h < min_h:
+        if min_h > 0 and h > 0 and h < min_h:
             continue
         lines.append(text)
     return "\n".join(lines)
@@ -519,13 +534,20 @@ def _screenai_ocr_concat(engine, images):
         batch_h += fh
     sub_batches.append((batch_start, len(resized)))
 
+    # First pass: OCR all sub-batches, collect parsed lines and heights
+    sb_data = []  # list of (sb_start, sb_heights, parsed_lines, boundaries)
+    all_heights = []
     all_results = [""] * len(images)
+
     for sb_start, sb_end in sub_batches:
         sb_images = resized[sb_start:sb_end]
         sb_heights = frame_heights[sb_start:sb_end]
 
         if len(sb_images) == 1:
-            all_results[sb_start] = _screenai_ocr_image(engine, sb_images[0])
+            response = _screenai_perform_ocr(engine, sb_images[0])
+            parsed = _parse_response_lines(response.get("lines", []))
+            all_heights.extend(bbox.get("height", 0) for _, bbox in parsed)
+            sb_data.append((sb_start, sb_heights, parsed, None))
             continue
 
         total_h = sum(sb_heights)
@@ -540,27 +562,39 @@ def _screenai_ocr_concat(engine, images):
         response = _screenai_perform_ocr(engine, concat)
         concat.close()
 
-        # Assign lines to frames by Y center, filtering small noise per-frame
-        frame_lines = [[] for _ in sb_images]
-        for text, bbox in _parse_response_lines(response.get("lines", [])):
+        parsed = _parse_response_lines(response.get("lines", []))
+        all_heights.extend(bbox.get("height", 0) for _, bbox in parsed)
+        sb_data.append((sb_start, sb_heights, parsed, boundaries))
+
+    # Compute height threshold from all lines across the batch
+    min_h = _compute_min_line_height(all_heights)
+
+    # Second pass: assign lines to frames, filtering by threshold
+    for sb_start, sb_heights, parsed, boundaries in sb_data:
+        if boundaries is None:
+            # Single-image sub-batch
+            lines = []
+            for text, bbox in parsed:
+                h = bbox.get("height", 0)
+                if min_h > 0 and h > 0 and h < min_h:
+                    continue
+                lines.append(text)
+            all_results[sb_start] = "\n".join(lines)
+            continue
+
+        n_frames = len(sb_heights)
+        frame_lines = [[] for _ in range(n_frames)]
+        for text, bbox in parsed:
             line_h = bbox.get("height", 0)
+            if min_h > 0 and line_h > 0 and line_h < min_h:
+                continue
             line_y = bbox.get("y", 0) + line_h / 2
-            assigned = False
             for fi, (ys, ye) in enumerate(boundaries):
                 if line_y < ye:
-                    # Filter: line must be at least _MIN_LINE_HEIGHT_FRAC of its frame
-                    frame_h = sb_heights[fi]
-                    if line_h > 0 and line_h < frame_h * _MIN_LINE_HEIGHT_FRAC:
-                        assigned = True
-                        break
                     frame_lines[fi].append(text)
-                    assigned = True
                     break
-            if not assigned:
-                fi = len(sb_images) - 1
-                frame_h = sb_heights[fi]
-                if not (line_h > 0 and line_h < frame_h * _MIN_LINE_HEIGHT_FRAC):
-                    frame_lines[fi].append(text)
+            else:
+                frame_lines[-1].append(text)
 
         for i, lines in enumerate(frame_lines):
             all_results[sb_start + i] = "\n".join(lines)

@@ -1013,21 +1013,6 @@ pyobjc-framework-CoreML = ">=12.1"
 pyobjc-framework-Quartz = ">=12.1"
 
 [[package]]
-name = "python-dotenv"
-version = "1.2.2"
-description = "Read key-value pairs from a .env file and set them as environment variables"
-optional = false
-python-versions = ">=3.10"
-groups = ["main"]
-files = [
-    {file = "python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a"},
-    {file = "python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3"},
-]
-
-[package.extras]
-cli = ["click (>=5.0)"]
-
-[[package]]
 name = "pyyaml"
 version = "6.0.3"
 description = "YAML parser and emitter for Python"
@@ -1589,4 +1574,4 @@ mlx = ["mlx-lm"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<4.0"
-content-hash = "1fa6be285a201338bb421bb8d8cf72fcfc399c0932a0c531c8e9295e41ef68a5"
+content-hash = "11ac63f25e4e2aa4f8532d6e1ff07e2ea1fe9fa2aace0703cb9fa1c65cb21883"

@@ -1170,9 +1170,9 @@ def main():
     parser.add_argument("video", help="Input video file path")
     parser.add_argument(
         "--scan-backend",
-        required=True,
+        default="screenai",
         choices=["apple", "screenai"],
-        help="OCR backend: apple (macOS Vision) or screenai (Chrome Screen AI)",
+        help="OCR backend: apple (macOS Vision) or screenai (Chrome Screen AI) (default: screenai)",
     )
     parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt)")
     parser.add_argument(
@@ -1191,9 +1191,9 @@ def main():
     )
     parser.add_argument(
         "--cleanup-backend",
-        default=None,
+        default="rules",
         choices=["none", "rules"],
-        help="Cleanup backend: rules (local, no LLM), none (skip)",
+        help="Cleanup backend (default: rules): rules (local, no LLM), none (skip)",
     )
     parser.add_argument(
         "--scan-batch-size",
@@ -1220,15 +1220,10 @@ def main():
             scan_only_incompatible.append("--output")
         if args.languages != ["zh-Hant"]:
             scan_only_incompatible.append("--languages")
-        if args.cleanup_backend is not None:
-            scan_only_incompatible.append("--cleanup-backend")
         if scan_only_incompatible:
             parser.error(
                 f"--scan-only is incompatible with: {', '.join(scan_only_incompatible)}"
             )
-    else:
-        if args.cleanup_backend is None:
-            parser.error("--cleanup-backend is required when not using --scan-only")
 
     video_path = args.video
     if not os.path.isfile(video_path):

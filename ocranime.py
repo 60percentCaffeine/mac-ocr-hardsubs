@@ -443,15 +443,15 @@ def _screenai_perform_ocr(engine, img):
     return MessageToDict(annotation, preserving_proto_field_name=True)
 
 
-def _filter_small_lines(response_lines, min_height_ratio=0.5):
-    """Filter out OCR lines whose bounding box height is much smaller than the median.
+# Minimum line bounding-box height as a fraction of the source frame height.
+# Lines shorter than this are treated as UI noise (watermarks, usernames,
+# timestamps, etc.).  Subtitle text is typically ≥ 29% of the cropped frame
+# height; noise text is typically ≤ 26%.
+_MIN_LINE_HEIGHT_FRAC = 0.27
 
-    Small text (watermarks, logos, UI noise) tends to have significantly shorter
-    bounding box height than actual subtitle text.  Lines with height below
-    ``min_height_ratio`` of the median height are dropped.
 
-    Returns a list of (text, bbox_dict) tuples for lines that pass the filter.
-    """
+def _parse_response_lines(response_lines):
+    """Parse OCR response lines into (text, bbox) tuples."""
     parsed = []
     for line in response_lines:
         text = line.get("utf8_string", "").strip()
@@ -459,34 +459,18 @@ def _filter_small_lines(response_lines, min_height_ratio=0.5):
             continue
         bbox = line.get("bounding_box", {})
         parsed.append((text, bbox))
-
-    if len(parsed) <= 1:
-        # With only one line, fall back to an absolute check: if the line
-        # height is less than 2% of the image it came from, treat it as noise.
-        # Callers needing the absolute check should use _filter_small_lines_abs.
-        return parsed
-
-    heights = [bbox.get("height", 0) for _, bbox in parsed]
-    sorted_h = sorted(heights)
-    median_h = sorted_h[len(sorted_h) // 2]
-    if median_h <= 0:
-        return parsed
-
-    threshold = median_h * min_height_ratio
-    return [(text, bbox) for text, bbox in parsed if bbox.get("height", 0) >= threshold]
+    return parsed
 
 
 def _screenai_ocr_image(engine, img):
     """Run Screen AI OCR on a PIL Image, return recognized text string."""
     response = _screenai_perform_ocr(engine, img)
     img_h = img.height
-    filtered = _filter_small_lines(response.get("lines", []))
-    # For single-frame images, also apply absolute height filter:
-    # lines shorter than 2% of the image height are likely noise.
+    min_h = img_h * _MIN_LINE_HEIGHT_FRAC
     lines = []
-    for text, bbox in filtered:
+    for text, bbox in _parse_response_lines(response.get("lines", [])):
         h = bbox.get("height", 0)
-        if img_h > 0 and h > 0 and h < img_h * 0.02:
+        if h > 0 and h < min_h:
             continue
         lines.append(text)
     return "\n".join(lines)
@@ -556,17 +540,27 @@ def _screenai_ocr_concat(engine, images):
         response = _screenai_perform_ocr(engine, concat)
         concat.close()
 
-        # Filter out small noise lines, then assign to frames by Y center
-        filtered = _filter_small_lines(response.get("lines", []))
+        # Assign lines to frames by Y center, filtering small noise per-frame
         frame_lines = [[] for _ in sb_images]
-        for text, bbox in filtered:
-            line_y = bbox.get("y", 0) + bbox.get("height", 0) / 2
+        for text, bbox in _parse_response_lines(response.get("lines", [])):
+            line_h = bbox.get("height", 0)
+            line_y = bbox.get("y", 0) + line_h / 2
+            assigned = False
             for fi, (ys, ye) in enumerate(boundaries):
                 if line_y < ye:
+                    # Filter: line must be at least _MIN_LINE_HEIGHT_FRAC of its frame
+                    frame_h = sb_heights[fi]
+                    if line_h > 0 and line_h < frame_h * _MIN_LINE_HEIGHT_FRAC:
+                        assigned = True
+                        break
                     frame_lines[fi].append(text)
+                    assigned = True
                     break
-            else:
-                frame_lines[-1].append(text)
+            if not assigned:
+                fi = len(sb_images) - 1
+                frame_h = sb_heights[fi]
+                if not (line_h > 0 and line_h < frame_h * _MIN_LINE_HEIGHT_FRAC):
+                    frame_lines[fi].append(text)
 
         for i, lines in enumerate(frame_lines):
             all_results[sb_start + i] = "\n".join(lines)

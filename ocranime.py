@@ -75,66 +75,6 @@ def _frames_are_similar(prev_arr, curr_arr):
     return float(np.mean(np.abs(curr_arr - prev_arr))) < FRAMEDIFF_THRESHOLD
 
 
-def detect_text_frames(frames, languages, scan_backend="apple"):
-    """OCR all frames, return list of recognized text (empty string if no text).
-
-    Uses accurate mode because fast mode doesn't reliably detect CJK text.
-    Results are cached so the accurate OCR pass can reuse them.
-
-    Two cheap pre-filters avoid expensive OCR calls:
-    1. Edge variance — skip frames that clearly have no text.
-    2. Frame differencing — reuse the previous OCR result when consecutive
-       frames are nearly identical (same subtitle held across frames).
-    """
-    import numpy as np
-
-    ocr_fn = ocr_frame_dotsocr if scan_backend == "dotsocr" else ocr_frame_apple
-
-    # Pre-filter: skip frames that clearly have no text
-    print("Pre-filtering frames...", end="", flush=True)
-    candidates = set()
-    frame_arrays = {}
-    for idx, frame in enumerate(frames):
-        arr = _load_frame_gray(frame)
-        frame_arrays[idx] = arr
-        dx = np.abs(np.diff(arr, axis=1))
-        dy = np.abs(np.diff(arr, axis=0))
-        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
-            candidates.add(idx)
-    edge_skipped = len(frames) - len(candidates)
-    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
-
-    # Pre-load the model before starting progress display
-    if scan_backend == "dotsocr":
-        _load_dotsocr()
-
-    texts = []
-    diff_reused = 0
-    last_ocr_text = ""
-    last_ocr_arr = None
-    for idx, frame in enumerate(frames):
-        if idx not in candidates:
-            texts.append("")
-            last_ocr_text = ""
-            last_ocr_arr = None
-        elif last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, frame_arrays[idx]):
-            texts.append(last_ocr_text)
-            diff_reused += 1
-        else:
-            text = ocr_fn(frame, languages, fast=False).strip()
-            texts.append(text)
-            last_ocr_text = text
-            last_ocr_arr = frame_arrays[idx]
-        progress = (idx + 1) / len(frames) * 100
-        print(f"\rOCR: {progress:.0f}%", end="", flush=True)
-    print()
-    if diff_reused:
-        print(f"Frame differencing reused OCR for {diff_reused} frames")
-    # Free frame arrays
-    frame_arrays.clear()
-    return texts
-
-
 def build_clips(texts, sample_interval):
     """Build clips (start_idx, end_idx) from consecutive non-empty texts, drop short ones."""
     clips = []
@@ -386,205 +326,6 @@ def detect_text_frames_apple(frames, languages, num_workers=None, batch_size=16)
         print(f"Frame differencing reused OCR for {diff_reused} frames")
     frame_arrays.clear()
     return texts
-
-
-# ── DotsMOCR (GPU) backend ─────────────────────────────────────────────
-
-_dotsocr_model = None
-_dotsocr_processor = None
-
-
-def _load_dotsocr():
-    """Load the DotsMOCR model and processor (cached after first call)."""
-    global _dotsocr_model, _dotsocr_processor
-    if _dotsocr_model is not None:
-        return _dotsocr_model, _dotsocr_processor
-
-    import torch
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
-
-    model_id = os.environ.get("DOTSOCR_MODEL", "rednote-hilab/dots.mocr")
-
-    print(f"Loading DotsMOCR model ({model_id})...", flush=True)
-    try:
-        import flash_attn  # noqa: F401
-        attn_impl = "flash_attention_2"
-    except ImportError:
-        sys.exit(
-            "Error: flash-attn is required for the dotsocr backend but is not installed.\n"
-            "Install it with: poetry run pip install flash-attn --no-build-isolation"
-        )
-
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-    if hasattr(config, "vision_config") and attn_impl != "flash_attention_2":
-        config.vision_config.attn_implementation = attn_impl
-    _dotsocr_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        config=config,
-        attn_implementation=attn_impl,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    _dotsocr_processor = AutoProcessor.from_pretrained(
-        model_id, trust_remote_code=True
-    )
-    print("DotsMOCR model loaded.", flush=True)
-    return _dotsocr_model, _dotsocr_processor
-
-
-def ocr_frame_dotsocr(frame_path, languages, fast):
-    """Run DotsMOCR OCR on a single frame using GPU, return recognized text."""
-    from qwen_vl_utils import process_vision_info
-
-    model, processor = _load_dotsocr()
-
-    prompt = "Extract the text content from this image."
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": str(frame_path)},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
-
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = inputs.to("cuda")
-
-    import logging
-    logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
-    generated_ids = model.generate(**inputs, max_new_tokens=512)
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):]
-        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )
-    return output_text[0].strip() if output_text else ""
-
-
-# ── DotsMOCR 4-bit quantized (GPU) backend ───────────────────────────────
-
-_dots4bit_model = None
-_dots4bit_processor = None
-
-
-def _load_dots4bit():
-    """Load the DotsMOCR model in 4-bit quantization (cached after first call)."""
-    global _dots4bit_model, _dots4bit_processor
-    if _dots4bit_model is not None:
-        return _dots4bit_model, _dots4bit_processor
-
-    import torch
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
-
-    model_id = os.environ.get("DOTSOCR_MODEL", "rednote-hilab/dots.mocr")
-
-    print(f"Loading DotsMOCR 4-bit model ({model_id})...", flush=True)
-
-    try:
-        import flash_attn  # noqa: F401
-        attn_impl = "flash_attention_2"
-    except ImportError:
-        attn_impl = "sdpa"
-        print("flash-attn not found, using SDPA attention", flush=True)
-
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_quant_type="nf4",
-    )
-
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-    if hasattr(config, "vision_config") and attn_impl != "flash_attention_2":
-        config.vision_config.attn_implementation = attn_impl
-    _dots4bit_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        config=config,
-        attn_implementation=attn_impl,
-        quantization_config=quantization_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    # Cast vision tower to bfloat16 to match processor output dtype
-    if hasattr(_dots4bit_model, "vision_tower"):
-        _dots4bit_model.vision_tower = _dots4bit_model.vision_tower.to(torch.bfloat16)
-    _dots4bit_processor = AutoProcessor.from_pretrained(
-        model_id, trust_remote_code=True
-    )
-    print("DotsMOCR 4-bit model loaded.", flush=True)
-    return _dots4bit_model, _dots4bit_processor
-
-
-def ocr_batch_dots4bit(frame_paths, languages, fast):
-    """Run DotsMOCR 4-bit OCR on a batch of frames, return list of recognized texts."""
-    from qwen_vl_utils import process_vision_info
-
-    model, processor = _load_dots4bit()
-    prompt = "Extract the text content from this image."
-
-    all_texts = []
-    all_image_inputs = []
-    for frame_path in frame_paths:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": str(frame_path)},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, _ = process_vision_info(messages)
-        all_texts.append(text)
-        all_image_inputs.extend(image_inputs)
-
-    inputs = processor(
-        text=all_texts,
-        images=all_image_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = inputs.to("cuda")
-
-    import logging
-    logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
-    generated_ids = model.generate(**inputs, max_new_tokens=512)
-
-    results = []
-    for i, in_ids in enumerate(inputs.input_ids):
-        out_ids = generated_ids[i][len(in_ids):]
-        decoded = processor.decode(out_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        results.append(decoded.strip())
-    return results
-
-
-def ocr_frame_dots4bit(frame_path, languages, fast):
-    """Run DotsMOCR 4-bit OCR on a single frame, return recognized text."""
-    results = ocr_batch_dots4bit([frame_path], languages, fast)
-    return results[0] if results else ""
-
-
-DOTS4BIT_BATCH_SIZE = 64
 
 
 # ── Chrome Screen AI backend ─────────────────────────────────────────────
@@ -1031,91 +772,6 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
             last_ocr_text = texts[idx]
             last_ocr_arr = frame_arrays[idx]
         else:
-            if last_ocr_arr is not None:
-                texts[idx] = last_ocr_text
-
-    print()
-    if diff_reused:
-        print(f"Frame differencing reused OCR for {diff_reused} frames")
-    frame_arrays.clear()
-    return texts
-
-
-def detect_text_frames_batched(frames, languages, batch_size=DOTS4BIT_BATCH_SIZE):
-    """OCR frames using batched 4-bit DotsMOCR for faster throughput.
-
-    Same pre-filtering as detect_text_frames but collects candidate frames
-    into batches for parallel GPU inference.
-    """
-    import numpy as np
-
-    # Pre-filter: skip frames that clearly have no text
-    print("Pre-filtering frames...", end="", flush=True)
-    candidates = set()
-    frame_arrays = {}
-    for idx, frame in enumerate(frames):
-        arr = _load_frame_gray(frame)
-        frame_arrays[idx] = arr
-        dx = np.abs(np.diff(arr, axis=1))
-        dy = np.abs(np.diff(arr, axis=0))
-        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
-            candidates.add(idx)
-    edge_skipped = len(frames) - len(candidates)
-    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
-
-    # Pre-load the model before starting progress display
-    _load_dots4bit()
-
-    # Build list of frames that need OCR (applying frame differencing)
-    texts = [""] * len(frames)
-    ocr_indices = []  # indices that need actual OCR
-    diff_reused = 0
-    last_ocr_text = ""
-    last_ocr_arr = None
-    for idx in range(len(frames)):
-        if idx not in candidates:
-            last_ocr_text = ""
-            last_ocr_arr = None
-        elif last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, frame_arrays[idx]):
-            texts[idx] = last_ocr_text
-            diff_reused += 1
-            # Don't update last_ocr_arr — keep comparing against the original OCR'd frame
-        else:
-            ocr_indices.append(idx)
-            last_ocr_text = ""  # placeholder, will be filled after batch OCR
-            last_ocr_arr = frame_arrays[idx]
-
-    if diff_reused:
-        print(f"Frame differencing will reuse OCR for {diff_reused} frames")
-
-    # Process OCR indices in batches
-    total_ocr = len(ocr_indices)
-    processed = 0
-    for batch_start in range(0, total_ocr, batch_size):
-        batch_indices = ocr_indices[batch_start : batch_start + batch_size]
-        batch_paths = [frames[i] for i in batch_indices]
-        batch_results = ocr_batch_dots4bit(batch_paths, languages, fast=False)
-        for i, idx in enumerate(batch_indices):
-            texts[idx] = batch_results[i]
-        processed += len(batch_indices)
-        progress = processed / total_ocr * 100 if total_ocr else 100
-        print(f"\rOCR: {progress:.0f}% ({processed}/{total_ocr} frames)", end="", flush=True)
-
-    # Second pass: propagate OCR results to diff-reused frames
-    # (because we didn't know the OCR text at diff-reuse time)
-    ocr_set = set(ocr_indices)
-    last_ocr_text = ""
-    last_ocr_arr = None
-    for idx in range(len(frames)):
-        if idx not in candidates:
-            last_ocr_text = ""
-            last_ocr_arr = None
-        elif idx in ocr_set:
-            # This was an OCR'd frame — update tracking
-            last_ocr_text = texts[idx]
-            last_ocr_arr = frame_arrays[idx]
-        else:
-            # This was a diff-reused frame — use the last OCR text
             if last_ocr_arr is not None:
                 texts[idx] = last_ocr_text
 
@@ -1796,8 +1452,8 @@ def main():
     parser.add_argument(
         "--scan-backend",
         required=True,
-        choices=["apple", "dotsocr", "dots4bit", "screenai"],
-        help="OCR backend: apple (macOS Vision), dotsocr (DotsMOCR bf16), dots4bit (DotsMOCR 4-bit quantized + batched), or screenai (Chrome Screen AI)",
+        choices=["apple", "screenai"],
+        help="OCR backend: apple (macOS Vision) or screenai (Chrome Screen AI)",
     )
     parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt)")
     parser.add_argument(
@@ -1844,7 +1500,7 @@ def main():
         "--scan-batch-size",
         type=int,
         default=None,
-        help="Batch size for apple/dots4bit/screenai backends (default: 16 for apple, 64 for dots4bit and screenai)",
+        help="Batch size for apple/screenai backends (default: 16 for apple, 64 for screenai)",
     )
     parser.add_argument(
         "--scan-threads",
@@ -1906,14 +1562,10 @@ def main():
 
         # OCR all frames
         batch_size = args.scan_batch_size
-        if args.scan_backend == "dots4bit":
-            ocr_texts = detect_text_frames_batched(frames, args.languages, batch_size=batch_size or DOTS4BIT_BATCH_SIZE)
-        elif args.scan_backend == "screenai":
+        if args.scan_backend == "screenai":
             ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=batch_size or 64)
         elif args.scan_backend == "apple":
             ocr_texts = detect_text_frames_apple(frames, args.languages, num_workers=args.scan_threads, **({"batch_size": batch_size} if batch_size is not None else {}))
-        else:
-            ocr_texts = detect_text_frames(frames, args.languages, scan_backend=args.scan_backend)
         clips = build_clips(ocr_texts, sample_interval)
         text_frame_count = sum(e - s + 1 for s, e in clips)
         print(

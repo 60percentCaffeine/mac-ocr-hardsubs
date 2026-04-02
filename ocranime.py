@@ -443,9 +443,11 @@ def _screenai_perform_ocr(engine, img):
     return MessageToDict(annotation, preserving_proto_field_name=True)
 
 
-# Lines shorter than this fraction of the median line height across a batch
-# are treated as UI noise (watermarks, usernames, timestamps, etc.).
-_BBOX_HEIGHT_RATIO = 0.75
+# Lines outside this height range (relative to median) are treated as noise.
+# Below: small UI text (watermarks, usernames, timestamps).
+# Above: large background text (title cards, signs, logos).
+_BBOX_HEIGHT_RATIO_MIN = 0.75
+_BBOX_HEIGHT_RATIO_MAX = 1.5
 
 
 def _parse_response_lines(response_lines):
@@ -460,43 +462,40 @@ def _parse_response_lines(response_lines):
     return parsed
 
 
-def _compute_min_line_height(all_heights):
-    """Compute minimum line height threshold from observed bbox heights.
+def _compute_line_height_range(all_heights):
+    """Compute allowed line height range from observed bbox heights.
 
     Since most OCR lines are subtitles (consistent height), the median height
-    represents the subtitle size.  Returns a threshold below which lines are
-    considered noise.  Returns 0 if there aren't enough lines to decide.
+    represents the subtitle size.  Returns (min_h, max_h) thresholds.
+    Returns (0, 0) if there aren't enough lines to decide.
     """
     if len(all_heights) < 2:
-        return 0
+        return 0, 0
     sorted_h = sorted(all_heights)
     median_h = sorted_h[len(sorted_h) // 2]
     if median_h <= 0:
-        return 0
-    return median_h * _BBOX_HEIGHT_RATIO
+        return 0, 0
+    return median_h * _BBOX_HEIGHT_RATIO_MIN, median_h * _BBOX_HEIGHT_RATIO_MAX
 
 
 def _screenai_ocr_image(engine, img):
-    """Run Screen AI OCR on a PIL Image, return recognized text string."""
+    """Run Screen AI OCR on a PIL Image, return list of (text, x, y, w, h) tuples."""
     response = _screenai_perform_ocr(engine, img)
-    parsed = _parse_response_lines(response.get("lines", []))
-    heights = [bbox.get("height", 0) for _, bbox in parsed]
-    min_h = _compute_min_line_height(heights)
-    lines = []
-    for text, bbox in parsed:
-        h = bbox.get("height", 0)
-        if min_h > 0 and h > 0 and h < min_h:
-            continue
-        lines.append(text)
-    return "\n".join(lines)
+    return [(text, bbox.get("x", 0), bbox.get("y", 0),
+             bbox.get("width", 0), bbox.get("height", 0))
+            for text, bbox in _parse_response_lines(response.get("lines", []))]
 
 
 def _screenai_ocr_concat(engine, images):
     """OCR multiple images in one call by concatenating them vertically.
 
-    Returns a list of text strings, one per input image.  Uses bounding-box
-    Y coordinates from the protobuf response to assign lines to their source
-    frame within the concatenated image.
+    Returns a list of per-frame line data.  Each element is a list of
+    ``(text, height)`` tuples — one per detected OCR line assigned to that
+    frame.  No height filtering is applied here; the caller is responsible
+    for computing thresholds globally and filtering.
+
+    Uses bounding-box Y coordinates from the protobuf response to assign
+    lines to their source frame within the concatenated image.
 
     If the concatenated height would exceed max_pixel_size, the batch is split
     into sub-batches that each fit within the limit to avoid quality-destroying
@@ -534,20 +533,14 @@ def _screenai_ocr_concat(engine, images):
         batch_h += fh
     sub_batches.append((batch_start, len(resized)))
 
-    # First pass: OCR all sub-batches, collect parsed lines and heights
-    sb_data = []  # list of (sb_start, sb_heights, parsed_lines, boundaries)
-    all_heights = []
-    all_results = [""] * len(images)
+    all_results = [[] for _ in images]  # list of list of (text, height)
 
     for sb_start, sb_end in sub_batches:
         sb_images = resized[sb_start:sb_end]
         sb_heights = frame_heights[sb_start:sb_end]
 
         if len(sb_images) == 1:
-            response = _screenai_perform_ocr(engine, sb_images[0])
-            parsed = _parse_response_lines(response.get("lines", []))
-            all_heights.extend(bbox.get("height", 0) for _, bbox in parsed)
-            sb_data.append((sb_start, sb_heights, parsed, None))
+            all_results[sb_start] = _screenai_ocr_image(engine, sb_images[0])
             continue
 
         total_h = sum(sb_heights)
@@ -562,42 +555,24 @@ def _screenai_ocr_concat(engine, images):
         response = _screenai_perform_ocr(engine, concat)
         concat.close()
 
-        parsed = _parse_response_lines(response.get("lines", []))
-        all_heights.extend(bbox.get("height", 0) for _, bbox in parsed)
-        sb_data.append((sb_start, sb_heights, parsed, boundaries))
-
-    # Compute height threshold from all lines across the batch
-    min_h = _compute_min_line_height(all_heights)
-
-    # Second pass: assign lines to frames, filtering by threshold
-    for sb_start, sb_heights, parsed, boundaries in sb_data:
-        if boundaries is None:
-            # Single-image sub-batch
-            lines = []
-            for text, bbox in parsed:
-                h = bbox.get("height", 0)
-                if min_h > 0 and h > 0 and h < min_h:
-                    continue
-                lines.append(text)
-            all_results[sb_start] = "\n".join(lines)
-            continue
-
-        n_frames = len(sb_heights)
-        frame_lines = [[] for _ in range(n_frames)]
-        for text, bbox in parsed:
-            line_h = bbox.get("height", 0)
-            if min_h > 0 and line_h > 0 and line_h < min_h:
-                continue
-            line_y = bbox.get("y", 0) + line_h / 2
+        # Assign each line to a frame based on bounding box Y center
+        frame_lines = [[] for _ in sb_images]
+        for text, bbox in _parse_response_lines(response.get("lines", [])):
+            bx = bbox.get("x", 0)
+            by = bbox.get("y", 0)
+            bw = bbox.get("width", 0)
+            bh = bbox.get("height", 0)
+            line_y = by + bh / 2
             for fi, (ys, ye) in enumerate(boundaries):
                 if line_y < ye:
-                    frame_lines[fi].append(text)
+                    # Adjust Y to be relative to the source frame
+                    frame_lines[fi].append((text, bx, by - ys, bw, bh))
                     break
             else:
-                frame_lines[-1].append(text)
+                frame_lines[-1].append((text, bx, by - boundaries[-1][0], bw, bh))
 
         for i, lines in enumerate(frame_lines):
-            all_results[sb_start + i] = "\n".join(lines)
+            all_results[sb_start + i] = lines
 
     return all_results
 
@@ -609,17 +584,20 @@ def ocr_frame_screenai(frame_path, languages, fast):
     _ensure_screenai_downloaded()
     engine = _load_screenai()
     img = Image.open(frame_path)
-    text = _screenai_ocr_image(engine, img)
+    lines = _screenai_ocr_image(engine, img)
     img.close()
-    return text
+    return "\n".join(text for text, *_ in lines)
 
 
 def _screenai_worker_ocr(task):
-    """Worker function: OCR one or more frames, return (indices, texts).
+    """Worker function: OCR one or more frames, return (indices, frame_lines).
 
     Accepts (indices, paths) tuple.  When multiple paths are given the frames
     are concatenated into a single image for one PerformOCR call, and results
     are split back by bounding-box Y coordinate.
+
+    Returns (indices, frame_lines) where frame_lines is a list of
+    list-of-(text, height) per frame.
     """
     indices, frame_paths = task
     from PIL import Image
@@ -630,10 +608,10 @@ def _screenai_worker_ocr(task):
         _screenai_worker_ocr._stderr_suppressed = True
     engine = _load_screenai()
     images = [Image.open(p) for p in frame_paths]
-    texts = _screenai_ocr_concat(engine, images)
+    frame_lines = _screenai_ocr_concat(engine, images)
     for img in images:
         img.close()
-    return indices, [t.strip() for t in texts]
+    return indices, frame_lines
 
 
 
@@ -774,7 +752,7 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
     print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
 
     # Build list of frames that need OCR (applying frame differencing)
-    texts = [""] * len(frames)
+    frame_lines = [[] for _ in frames]  # list of (text, height) per frame
     ocr_indices = []
     diff_reused = 0
     last_ocr_arr = None
@@ -808,9 +786,9 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
     batch_label = f", concat {bs}" if bs > 1 else ""
     print(f"OCR: 0% (0/{total_ocr} frames, {num_workers} workers{batch_label})", end="", flush=True)
     done = 0
-    for task_indices, task_texts in pool.imap_unordered(_screenai_worker_ocr, ocr_tasks):
-        for ti, text in zip(task_indices, task_texts):
-            texts[ocr_indices[ti]] = text
+    for task_indices, task_frame_lines in pool.imap_unordered(_screenai_worker_ocr, ocr_tasks):
+        for ti, lines in zip(task_indices, task_frame_lines):
+            frame_lines[ocr_indices[ti]] = lines
         done += len(task_indices)
         progress = done / total_ocr * 100 if total_ocr else 100
         print(f"\rOCR: {progress:.0f}% ({done}/{total_ocr} frames, {num_workers} workers{batch_label})", end="", flush=True)
@@ -819,24 +797,49 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
 
     # Propagate OCR results to diff-reused frames
     ocr_set = set(ocr_indices)
-    last_ocr_text = ""
+    last_ocr_lines = []
     last_ocr_arr = None
     for idx in range(len(frames)):
         if idx not in candidates:
-            last_ocr_text = ""
+            last_ocr_lines = []
             last_ocr_arr = None
         elif idx in ocr_set:
-            last_ocr_text = texts[idx]
+            last_ocr_lines = frame_lines[idx]
             last_ocr_arr = frame_arrays[idx]
         else:
             if last_ocr_arr is not None:
-                texts[idx] = last_ocr_text
+                frame_lines[idx] = last_ocr_lines
 
     print()
     if diff_reused:
         print(f"Frame differencing reused OCR for {diff_reused} frames")
     frame_arrays.clear()
-    return texts
+
+    # Compute bbox height threshold from ALL frames, weighted by frame count.
+    # Each height is counted once per frame it appears in (including
+    # diff-propagated frames), so persistent subtitle text dominates over
+    # transient noise.
+    all_heights = []
+    for lines in frame_lines:
+        for _text, _x, _y, _w, h in lines:
+            if h > 0:
+                all_heights.append(h)
+    min_h, max_h = _compute_line_height_range(all_heights)
+    if all_heights:
+        sorted_h = sorted(all_heights)
+        median_h = sorted_h[len(sorted_h) // 2]
+        print(f"Bbox filter: median_h={median_h:.0f} keep=[{min_h:.0f}, {max_h:.0f}] ({len(all_heights)} samples)")
+
+    # Apply threshold and produce final text strings
+    texts = [""] * len(frames)
+    for idx, lines in enumerate(frame_lines):
+        kept = []
+        for text, _x, _y, _w, h in lines:
+            if min_h > 0 and h > 0 and (h < min_h or h > max_h):
+                continue
+            kept.append(text)
+        texts[idx] = "\n".join(kept)
+    return texts, frame_lines
 
 
 def format_timestamp(seconds):
@@ -1217,6 +1220,51 @@ def cap_durations(entries, max_duration=MAX_SUBTITLE_DURATION):
     return result
 
 
+def _write_bbox_csv(csv_path, frame_lines, sample_interval):
+    """Write per-line bounding box data to CSV, sorted by height.
+
+    Aggregates identical (text, bbox) tuples across consecutive frames into
+    a single row with a duration column.  ``frame_lines`` is the raw per-frame
+    list of (text, x, y, w, h) tuples *before* height filtering.
+    """
+    import csv
+
+    # Aggregate: for each unique (text, x, y, w, h), track first/last frame
+    # We group consecutive runs so the same text reappearing later gets its
+    # own row.
+    rows = []  # (text, x, y, w, h, start_idx, end_idx)
+    prev_keys = {}  # (text, x, y, w, h) -> row index in rows (for current run)
+    for idx, lines in enumerate(frame_lines):
+        current_keys = set()
+        for text, x, y, w, h in lines:
+            key = (text, round(x), round(y), round(w), round(h))
+            current_keys.add(key)
+            if key in prev_keys:
+                # Extend existing run
+                rows[prev_keys[key]] = (*key, rows[prev_keys[key]][5], idx)
+            else:
+                prev_keys[key] = len(rows)
+                rows.append((*key, idx, idx))
+        # Remove keys that didn't appear this frame (run ended)
+        for key in list(prev_keys):
+            if key not in current_keys:
+                del prev_keys[key]
+
+    # Convert to final format with duration, sort by height
+    csv_rows = []
+    for text, x, y, w, h, start_idx, end_idx in rows:
+        duration = (end_idx - start_idx + 1) * sample_interval
+        csv_rows.append((text, x, y, w, h, round(duration, 3)))
+    csv_rows.sort(key=lambda r: r[4])  # sort by bbh
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["line", "bbx", "bby", "bbw", "bbh", "duration"])
+        for text, x, y, w, h, duration in csv_rows:
+            writer.writerow([text, x, y, w, h, duration])
+    print(f"Written {len(csv_rows)} bbox entries to {csv_path}")
+
+
 def write_srt(entries, output_path):
     """Write entries as SRT file."""
     with open(output_path, "w", encoding="utf-8") as f:
@@ -1275,6 +1323,11 @@ def main():
         action="store_true",
         help="Only generate subtitle frame PNGs in scanned_frames/, skip SRT generation",
     )
+    parser.add_argument(
+        "--bbox-csv",
+        default=None,
+        help="Write per-line bounding box data to a CSV file (line,bbx,bby,bbw,bbh,duration)",
+    )
     args = parser.parse_args()
 
     scan_only_incompatible = []
@@ -1326,8 +1379,9 @@ def main():
 
             # OCR all frames
             batch_size = args.scan_batch_size
+            raw_frame_lines = None  # per-frame [(text, x, y, w, h)] before filtering
             if args.scan_backend == "screenai":
-                ocr_texts = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=batch_size or 64)
+                ocr_texts, raw_frame_lines = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=batch_size or 64)
             elif args.scan_backend == "apple":
                 ocr_texts = detect_text_frames_apple(frames, args.languages, num_workers=args.scan_threads, **({"batch_size": batch_size} if batch_size is not None else {}))
             clips = build_clips(ocr_texts, sample_interval)
@@ -1347,6 +1401,10 @@ def main():
                     dest = scanned_dir / f"{h:02d}-{m:02d}-{s_sec:02d}-{ms:03d}.png"
                     shutil.copy2(frames[idx], dest)
             print(f"Saved {text_frame_count} frame PNGs to {scanned_dir}/")
+
+            # Write per-line bounding box CSV if requested
+            if args.bbox_csv and raw_frame_lines is not None:
+                _write_bbox_csv(args.bbox_csv, raw_frame_lines, sample_interval)
 
             if args.scan_only:
                 print("Scan-only mode: skipping SRT generation.")

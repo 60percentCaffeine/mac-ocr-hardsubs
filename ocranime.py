@@ -830,15 +830,58 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
         median_h = sorted_h[len(sorted_h) // 2]
         print(f"Bbox filter: median_h={median_h:.0f} keep=[{min_h:.0f}, {max_h:.0f}] ({len(all_heights)} samples)")
 
-    # Apply threshold and produce final text strings
+    # Apply threshold and produce final text strings, merging same-line bboxes
+    import re
+    def _cjk_space_to_ideo(s):
+        """Replace ASCII spaces with ideographic space unless both neighbors are ASCII."""
+        return re.sub(
+            r'(?<![A-Za-z0-9]) | (?![A-Za-z0-9])',
+            '\u3000', s)
+    _SAMELINE_Y_THRESH = 10  # max Y difference to consider bboxes on same line
+    _SAMELINE_X_GAP = 50     # max horizontal gap between adjacent bboxes
     texts = [""] * len(frames)
     for idx, lines in enumerate(frame_lines):
         kept = []
-        for text, _x, _y, _w, h in lines:
+        for text, x, y, w, h in lines:
             if min_h > 0 and h > 0 and (h < min_h or h > max_h):
                 continue
-            kept.append(text)
-        texts[idx] = "\n".join(kept)
+            kept.append((text, x, y, w, h))
+        if not kept:
+            texts[idx] = ""
+            continue
+        # Sort by x so left-to-right order is correct
+        kept.sort(key=lambda b: b[1])
+        # Group bboxes on the same visual line (similar Y coordinate)
+        row_groups = []  # list of lists of (text, x, y, w, h)
+        for box in kept:
+            merged = False
+            for group in row_groups:
+                ref_y = group[0][2]  # Y of first box in group
+                if abs(box[2] - ref_y) <= _SAMELINE_Y_THRESH:
+                    group.append(box)
+                    merged = True
+                    break
+            if not merged:
+                row_groups.append([box])
+        # Sort groups top-to-bottom by average Y
+        row_groups.sort(key=lambda g: sum(b[2] for b in g) / len(g))
+        # Within each group, merge horizontally adjacent bboxes
+        merged_lines = []
+        for group in row_groups:
+            group.sort(key=lambda b: b[1])  # sort by x within group
+            parts = [_cjk_space_to_ideo(group[0][0])]
+            for i in range(1, len(group)):
+                prev = group[i - 1]
+                cur = group[i]
+                gap = cur[1] - (prev[1] + prev[3])  # cur_x - (prev_x + prev_w)
+                if gap <= _SAMELINE_X_GAP:
+                    parts.append(_cjk_space_to_ideo(cur[0]))
+                else:
+                    # Too far apart, treat as separate segment
+                    merged_lines.append("\u3000".join(parts))
+                    parts = [_cjk_space_to_ideo(cur[0])]
+            merged_lines.append("\u3000".join(parts))
+        texts[idx] = "\n".join(merged_lines)
     return texts, frame_lines
 
 

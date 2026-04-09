@@ -35,6 +35,30 @@ def extract_frames(video_path, tmpdir, crop, fps):
     return frames
 
 
+def extract_frames_crop2(video_path, tmpdir, crop2, fps):
+    """Extract frames with two crop regions (top+bottom) vstacked, then sampled at given fps."""
+    output_pattern = os.path.join(tmpdir, "%06d.png")
+    top_crop, bottom_crop = crop2
+    filter_complex = (
+        f"[0:v]crop={top_crop}[top];"
+        f"[0:v]crop={bottom_crop}[bottom];"
+        f"[top][bottom]vstack,fps={fps}"
+    )
+    cmd = [
+        "ffmpeg",
+        "-i",
+        video_path,
+        "-filter_complex",
+        filter_complex,
+        "-loglevel",
+        "error",
+        output_pattern,
+    ]
+    subprocess.run(cmd, check=True)
+    frames = sorted(Path(tmpdir).glob("*.png"))
+    return frames
+
+
 PREFILTER_EDGE_THRESHOLD = 2.0  # frames below this edge variance are skipped
 FRAMEDIFF_THRESHOLD = 5.0  # frames with mean pixel diff below this reuse prev OCR
 
@@ -1329,10 +1353,17 @@ def main():
         help="OCR backend: apple (macOS Vision) or screenai (Chrome Screen AI) (default: screenai)",
     )
     parser.add_argument("-o", "--output", help="Output SRT path (default: <video>.srt), or output folder when processing multiple files")
-    parser.add_argument(
+    crop_group = parser.add_mutually_exclusive_group()
+    crop_group.add_argument(
         "--crop",
         default="iw*0.7:ih*0.15:iw*0.15:ih*0.8",
         help="ffmpeg crop filter (default: iw*0.7:ih*0.15:iw*0.15:ih*0.8)",
+    )
+    crop_group.add_argument(
+        "--crop2",
+        nargs=2,
+        metavar=("TOP_CROP", "BOTTOM_CROP"),
+        help="Two ffmpeg crop filters (top and bottom regions) vstacked together",
     )
     parser.add_argument(
         "--fps", type=int, default=4, help="Frames per second to sample (default: 4)"
@@ -1417,7 +1448,10 @@ def main():
 
         with tempfile.TemporaryDirectory(prefix="ocranime_") as tmpdir:
             print(f"Extracting frames ({fps} fps)...")
-            frames = extract_frames(video_path, tmpdir, args.crop, fps)
+            if args.crop2:
+                frames = extract_frames_crop2(video_path, tmpdir, args.crop2, fps)
+            else:
+                frames = extract_frames(video_path, tmpdir, args.crop, fps)
             print(f"Extracted {len(frames)} frames")
 
             # OCR all frames

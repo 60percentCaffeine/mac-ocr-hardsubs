@@ -734,6 +734,65 @@ def _screenai_warmup(_=None):
     return True
 
 
+def _cjk_space_to_ideo(s):
+    """Replace ASCII spaces with ideographic space unless both neighbors are ASCII."""
+    return re.sub(
+        r'(?<![A-Za-z0-9]) | (?![A-Za-z0-9])',
+        '\u3000', s)
+
+
+_SAMELINE_Y_THRESH = 10  # max Y difference to consider bboxes on same line
+_SAMELINE_X_GAP = 50     # max horizontal gap between adjacent bboxes
+
+
+def _build_texts_from_frame_lines(frame_lines, num_frames, min_h, max_h):
+    """Build per-frame text strings from raw bbox data, merging same-line bboxes."""
+    texts = [""] * num_frames
+    for idx, lines in enumerate(frame_lines):
+        kept = []
+        for text, x, y, w, h in lines:
+            if min_h > 0 and h > 0 and (h < min_h or h > max_h):
+                continue
+            kept.append((text, x, y, w, h))
+        if not kept:
+            texts[idx] = ""
+            continue
+        # Sort by x so left-to-right order is correct
+        kept.sort(key=lambda b: b[1])
+        # Group bboxes on the same visual line (similar Y coordinate)
+        row_groups = []  # list of lists of (text, x, y, w, h)
+        for box in kept:
+            merged = False
+            for group in row_groups:
+                ref_y = group[0][2]  # Y of first box in group
+                if abs(box[2] - ref_y) <= _SAMELINE_Y_THRESH:
+                    group.append(box)
+                    merged = True
+                    break
+            if not merged:
+                row_groups.append([box])
+        # Sort groups top-to-bottom by average Y
+        row_groups.sort(key=lambda g: sum(b[2] for b in g) / len(g))
+        # Within each group, merge horizontally adjacent bboxes
+        merged_lines = []
+        for group in row_groups:
+            group.sort(key=lambda b: b[1])  # sort by x within group
+            parts = [_cjk_space_to_ideo(group[0][0])]
+            for i in range(1, len(group)):
+                prev = group[i - 1]
+                cur = group[i]
+                gap = cur[1] - (prev[1] + prev[3])  # cur_x - (prev_x + prev_w)
+                if gap <= _SAMELINE_X_GAP:
+                    parts.append(_cjk_space_to_ideo(cur[0]))
+                else:
+                    # Too far apart, treat as separate segment
+                    merged_lines.append("\u3000".join(parts))
+                    parts = [_cjk_space_to_ideo(cur[0])]
+            merged_lines.append("\u3000".join(parts))
+        texts[idx] = "\n".join(merged_lines)
+    return texts
+
+
 def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=1):
     """OCR frames using Chrome Screen AI with parallel processes for speed.
 
@@ -854,58 +913,7 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
         median_h = sorted_h[len(sorted_h) // 2]
         print(f"Bbox filter: median_h={median_h:.0f} keep=[{min_h:.0f}, {max_h:.0f}] ({len(all_heights)} samples)")
 
-    # Apply threshold and produce final text strings, merging same-line bboxes
-    import re
-    def _cjk_space_to_ideo(s):
-        """Replace ASCII spaces with ideographic space unless both neighbors are ASCII."""
-        return re.sub(
-            r'(?<![A-Za-z0-9]) | (?![A-Za-z0-9])',
-            '\u3000', s)
-    _SAMELINE_Y_THRESH = 10  # max Y difference to consider bboxes on same line
-    _SAMELINE_X_GAP = 50     # max horizontal gap between adjacent bboxes
-    texts = [""] * len(frames)
-    for idx, lines in enumerate(frame_lines):
-        kept = []
-        for text, x, y, w, h in lines:
-            if min_h > 0 and h > 0 and (h < min_h or h > max_h):
-                continue
-            kept.append((text, x, y, w, h))
-        if not kept:
-            texts[idx] = ""
-            continue
-        # Sort by x so left-to-right order is correct
-        kept.sort(key=lambda b: b[1])
-        # Group bboxes on the same visual line (similar Y coordinate)
-        row_groups = []  # list of lists of (text, x, y, w, h)
-        for box in kept:
-            merged = False
-            for group in row_groups:
-                ref_y = group[0][2]  # Y of first box in group
-                if abs(box[2] - ref_y) <= _SAMELINE_Y_THRESH:
-                    group.append(box)
-                    merged = True
-                    break
-            if not merged:
-                row_groups.append([box])
-        # Sort groups top-to-bottom by average Y
-        row_groups.sort(key=lambda g: sum(b[2] for b in g) / len(g))
-        # Within each group, merge horizontally adjacent bboxes
-        merged_lines = []
-        for group in row_groups:
-            group.sort(key=lambda b: b[1])  # sort by x within group
-            parts = [_cjk_space_to_ideo(group[0][0])]
-            for i in range(1, len(group)):
-                prev = group[i - 1]
-                cur = group[i]
-                gap = cur[1] - (prev[1] + prev[3])  # cur_x - (prev_x + prev_w)
-                if gap <= _SAMELINE_X_GAP:
-                    parts.append(_cjk_space_to_ideo(cur[0]))
-                else:
-                    # Too far apart, treat as separate segment
-                    merged_lines.append("\u3000".join(parts))
-                    parts = [_cjk_space_to_ideo(cur[0])]
-            merged_lines.append("\u3000".join(parts))
-        texts[idx] = "\n".join(merged_lines)
+    texts = _build_texts_from_frame_lines(frame_lines, len(frames), min_h, max_h)
     return texts, frame_lines
 
 
@@ -1208,6 +1216,72 @@ def _clean_line(line):
     return line if line else None
 
 
+def _build_watermark_charset(watermark_text):
+    """Build a set of normalised characters from watermark text for fuzzy matching."""
+    chars = set()
+    for ch in watermark_text:
+        if ch.isspace():
+            continue
+        chars.add(ch.lower() if ch.isascii() else ch)
+    return chars
+
+
+_WATERMARK_MIN_CHARS = 3      # line must have at least this many matching chars
+_WATERMARK_OVERLAP_RATIO = 0.5  # at least this fraction of line chars must match
+
+
+def _bbox_matches_watermark(text, watermark_charset):
+    """Return True if a bbox text has high character overlap with the watermark."""
+    chars = [ch for ch in text if not ch.isspace()]
+    if not chars:
+        return False
+    matches = sum(
+        1 for ch in chars
+        if (ch.lower() if ch.isascii() else ch) in watermark_charset
+    )
+    return matches >= _WATERMARK_MIN_CHARS and matches / len(chars) >= _WATERMARK_OVERLAP_RATIO
+
+
+_WATERMARK_Y_TOLERANCE = 20  # pixels around median Y to consider watermark position
+
+
+def filter_watermark_bboxes(frame_lines, watermark_charset):
+    """Remove watermark bboxes from frame_lines using character overlap + Y position.
+
+    1. Scan all bboxes across all frames to find those matching the watermark charset.
+    2. Compute the median Y of matching bboxes — this is the watermark's stable position.
+    3. Remove bboxes that match BOTH character overlap AND are near that Y position.
+
+    Returns filtered frame_lines (new list, originals unchanged).
+    """
+    # Pass 1: find median Y of watermark-matching bboxes
+    wm_ys = []
+    for lines in frame_lines:
+        for text, _x, y, _w, _h in lines:
+            if _bbox_matches_watermark(text, watermark_charset):
+                wm_ys.append(y)
+    if not wm_ys:
+        return frame_lines
+    wm_ys.sort()
+    median_y = wm_ys[len(wm_ys) // 2]
+    removed = 0
+
+    # Pass 2: filter bboxes matching both charset and Y position
+    filtered = []
+    for lines in frame_lines:
+        kept = []
+        for entry in lines:
+            text, _x, y, _w, _h = entry
+            if (_bbox_matches_watermark(text, watermark_charset)
+                    and abs(y - median_y) <= _WATERMARK_Y_TOLERANCE):
+                removed += 1
+                continue
+            kept.append(entry)
+        filtered.append(kept)
+    print(f"Watermark filter: removed {removed} bboxes near y={median_y:.0f}")
+    return filtered
+
+
 def cleanup_rules(entries, languages=None):
     """Clean OCR artifacts using deterministic rules. Returns filtered entries."""
     if not entries:
@@ -1402,6 +1476,11 @@ def main():
         default=None,
         help="Write per-line bounding box data to a CSV file (line,bbx,bby,bbw,bbh,duration)",
     )
+    parser.add_argument(
+        "--watermark",
+        metavar="TEXT",
+        help="Watermark text to remove (fuzzy character-overlap matching catches OCR-garbled variants)",
+    )
     args = parser.parse_args()
 
     scan_only_incompatible = []
@@ -1461,6 +1540,15 @@ def main():
                 ocr_texts, raw_frame_lines = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=batch_size or 64)
             elif args.scan_backend == "apple":
                 ocr_texts = detect_text_frames_apple(frames, args.languages, num_workers=args.scan_threads, **({"batch_size": batch_size} if batch_size is not None else {}))
+
+            # Filter watermark bboxes before building clips
+            if args.watermark and raw_frame_lines is not None:
+                wm_charset = _build_watermark_charset(args.watermark)
+                filtered_fl = filter_watermark_bboxes(raw_frame_lines, wm_charset)
+                all_h = [h for lines in filtered_fl for _, _, _, _, h in lines if h > 0]
+                fl_min_h, fl_max_h = _compute_line_height_range(all_h)
+                ocr_texts = _build_texts_from_frame_lines(filtered_fl, len(frames), fl_min_h, fl_max_h)
+
             clips = build_clips(ocr_texts, sample_interval)
             text_frame_count = sum(e - s + 1 for s, e in clips)
             print(

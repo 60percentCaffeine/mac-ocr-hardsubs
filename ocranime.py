@@ -502,6 +502,60 @@ def _compute_line_height_range(all_heights):
     return median_h * _BBOX_HEIGHT_RATIO_MIN, median_h * _BBOX_HEIGHT_RATIO_MAX
 
 
+def cluster_heights(all_heights):
+    """Group observed bbox heights into clusters separated by gaps.
+
+    Two heights belong to the same cluster if they sit within max(3, 0.4*prev)
+    pixels of each other; a larger jump starts a new cluster.  Clusters with
+    fewer than max(5, 5% of samples) members are dropped as noise.  Returns a
+    list of (min_h, max_h) tuples sorted by ascending height.
+    """
+    if not all_heights:
+        return []
+    sorted_h = sorted(all_heights)
+    clusters = [[sorted_h[0]]]
+    for h in sorted_h[1:]:
+        last = clusters[-1][-1]
+        if h - last > max(3, last * 0.4):
+            clusters.append([])
+        clusters[-1].append(h)
+    min_size = max(5, len(all_heights) * 0.05)
+    return [(c[0], c[-1]) for c in clusters if len(c) >= min_size]
+
+
+def summarize_clusters(frame_lines, cluster_ranges, sample_interval):
+    """For each cluster, return dict with first_text and on-screen duration.
+
+    `first_text` is the merged text built from all cluster bboxes in the
+    earliest frame in which the cluster appears.  `duration` counts each frame
+    that contains at least one cluster bbox (sample_interval per frame).
+    """
+    out = []
+    for cmin, cmax in cluster_ranges:
+        first_text = ""
+        frames_with = 0
+        for lines in frame_lines:
+            in_cluster = [b for b in lines if cmin <= b[4] <= cmax]
+            if not in_cluster:
+                continue
+            frames_with += 1
+            if not first_text:
+                texts = _build_texts_from_frame_lines([in_cluster], 1, 0, 0)
+                first_text = texts[0].replace("\n", " / ")
+        out.append({
+            "min_h": cmin,
+            "max_h": cmax,
+            "first_text": first_text,
+            "duration": frames_with * sample_interval,
+        })
+    return out
+
+
+def filter_height_cluster(frame_lines, cmin, cmax):
+    """Keep only bboxes with height in [cmin, cmax].  Returns a new list."""
+    return [[b for b in lines if cmin <= b[4] <= cmax] for lines in frame_lines]
+
+
 def _screenai_ocr_image(engine, img):
     """Run Screen AI OCR on a PIL Image, return list of (text, x, y, w, h) tuples."""
     response = _screenai_perform_ocr(engine, img)
@@ -1570,10 +1624,23 @@ def main():
         metavar="W:H:X:Y",
         help="Ignore bboxes wholly contained inside this region (ffmpeg-style 'w:h:x:y' with iw/ih relative to the original video frame; not supported with --crop2)",
     )
+    parser.add_argument(
+        "--filter-cluster",
+        metavar="biggest|N",
+        help="Keep only bboxes from a single height cluster: 'biggest' picks the cluster with the largest height, or pass an integer index (0 = smallest height cluster, sorted ascending)",
+    )
     args = parser.parse_args()
 
     if args.blind_spot and args.crop2:
         parser.error("--blind-spot is not supported with --crop2")
+
+    if args.filter_cluster and args.filter_cluster != "biggest":
+        try:
+            n = int(args.filter_cluster)
+            if n < 0:
+                raise ValueError
+        except ValueError:
+            parser.error(f"--filter-cluster must be 'biggest' or a non-negative integer (got {args.filter_cluster!r})")
 
     scan_only_incompatible = []
     if args.scan_only:
@@ -1647,6 +1714,31 @@ def main():
                 fl_min_h, fl_max_h = _compute_line_height_range(all_h)
                 ocr_texts = _build_texts_from_frame_lines(raw_frame_lines, len(frames), fl_min_h, fl_max_h)
 
+            # Compute height clusters (informational + powers --filter-cluster).
+            # Done after blind-spot but before watermark so positional noise is
+            # already excluded from the cluster analysis.
+            cluster_ranges = []
+            cluster_summary = []
+            if raw_frame_lines is not None:
+                all_h = [h for lines in raw_frame_lines for _, _, _, _, h in lines if h > 0]
+                cluster_ranges = cluster_heights(all_h)
+                cluster_summary = summarize_clusters(raw_frame_lines, cluster_ranges, sample_interval)
+
+            if args.filter_cluster and cluster_ranges:
+                if args.filter_cluster == "biggest":
+                    chosen_idx = len(cluster_ranges) - 1
+                else:
+                    chosen_idx = int(args.filter_cluster)
+                if 0 <= chosen_idx < len(cluster_ranges):
+                    cmin, cmax = cluster_ranges[chosen_idx]
+                    raw_frame_lines = filter_height_cluster(raw_frame_lines, cmin, cmax)
+                    print(f"Cluster filter: kept cluster {chosen_idx} (h=[{cmin}, {cmax}])")
+                    all_h = [h for lines in raw_frame_lines for _, _, _, _, h in lines if h > 0]
+                    fl_min_h, fl_max_h = _compute_line_height_range(all_h)
+                    ocr_texts = _build_texts_from_frame_lines(raw_frame_lines, len(frames), fl_min_h, fl_max_h)
+                else:
+                    print(f"Cluster filter: index {chosen_idx} out of range (have {len(cluster_ranges)} clusters); skipping")
+
             # Filter watermark bboxes before building clips
             if args.watermark and raw_frame_lines is not None:
                 wm_charset = _build_watermark_charset(args.watermark)
@@ -1676,6 +1768,18 @@ def main():
             # Write per-line bounding box CSV if requested
             if args.bbox_csv and raw_frame_lines is not None:
                 _write_bbox_csv(args.bbox_csv, raw_frame_lines, sample_interval)
+
+            if cluster_summary:
+                print("Height clusters:")
+                for idx, info in enumerate(cluster_summary):
+                    text = info["first_text"]
+                    if len(text) > 60:
+                        text = text[:57] + "…"
+                    print(
+                        f"  cluster {idx}: height [{info['min_h']}, {info['max_h']}], "
+                        f"first subtitle \"{text}\", "
+                        f"weighted duration {info['duration']:.1f}s"
+                    )
 
             if args.scan_only:
                 print("Scan-only mode: skipping SRT generation.")

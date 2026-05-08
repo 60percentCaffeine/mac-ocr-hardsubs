@@ -489,32 +489,14 @@ def _parse_response_lines(response_lines):
 def _compute_line_height_range(all_heights):
     """Compute allowed line height range from observed bbox heights.
 
-    Subtitle text is typically the largest persistent text on screen.  When the
-    distribution is bimodal (subtitles plus smaller UI/chat text), a plain
-    median can latch onto the wrong cluster if small text outnumbers the
-    subtitle.  To handle this, group heights into clusters separated by gaps
-    and pick the cluster with the largest representative height.  Returns
-    (min_h, max_h) thresholds.  Returns (0, 0) if undecidable.
+    Since most OCR lines are subtitles (consistent height), the median height
+    represents the subtitle size.  Returns (min_h, max_h) thresholds.
+    Returns (0, 0) if there aren't enough lines to decide.
     """
     if len(all_heights) < 2:
         return 0, 0
     sorted_h = sorted(all_heights)
-    # Group consecutive heights into clusters.  A jump > 40% of the previous
-    # height (and at least 3px) starts a new cluster — heights within a single
-    # font size cluster tightly, but font-size differences leave a clear gap.
-    clusters = [[sorted_h[0]]]
-    for h in sorted_h[1:]:
-        last = clusters[-1][-1]
-        if h - last > max(3, last * 0.4):
-            clusters.append([])
-        clusters[-1].append(h)
-    # Drop tiny clusters (likely noise) — require at least 5% of all samples.
-    min_size = max(5, len(all_heights) * 0.05)
-    significant = [c for c in clusters if len(c) >= min_size] or clusters
-    # Subtitles are the biggest persistent text — pick the cluster whose median
-    # is largest among significant clusters.
-    chosen = max(significant, key=lambda c: c[len(c) // 2])
-    median_h = chosen[len(chosen) // 2]
+    median_h = sorted_h[len(sorted_h) // 2]
     if median_h <= 0:
         return 0, 0
     return median_h * _BBOX_HEIGHT_RATIO_MIN, median_h * _BBOX_HEIGHT_RATIO_MAX
@@ -927,9 +909,9 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
                 all_heights.append(h)
     min_h, max_h = _compute_line_height_range(all_heights)
     if all_heights:
-        # Recover the chosen cluster median from the keep range bounds.
-        chosen_median = min_h / _BBOX_HEIGHT_RATIO_MIN if min_h > 0 else 0
-        print(f"Bbox filter: chosen_h={chosen_median:.0f} keep=[{min_h:.0f}, {max_h:.0f}] ({len(all_heights)} samples)")
+        sorted_h = sorted(all_heights)
+        median_h = sorted_h[len(sorted_h) // 2]
+        print(f"Bbox filter: median_h={median_h:.0f} keep=[{min_h:.0f}, {max_h:.0f}] ({len(all_heights)} samples)")
 
     texts = _build_texts_from_frame_lines(frame_lines, len(frames), min_h, max_h)
     return texts, frame_lines
@@ -1234,6 +1216,90 @@ def _clean_line(line):
     return line if line else None
 
 
+def _eval_ffmpeg_expr(expr, iw, ih):
+    """Evaluate an ffmpeg-style coordinate expression with iw/ih bound.
+
+    Supports +, -, *, /, parentheses, integer/float literals, and the
+    variables iw and ih (image width/height).  Anything else raises.
+    """
+    import ast
+    tree = ast.parse(expr.strip(), mode="eval")
+    allowed_nodes = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Name, ast.Load,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.USub, ast.UAdd,
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed_nodes):
+            raise ValueError(f"Disallowed expression element {type(node).__name__!r} in {expr!r}")
+        if isinstance(node, ast.Name) and node.id not in ("iw", "ih"):
+            raise ValueError(f"Unknown variable {node.id!r} in {expr!r} (only iw, ih allowed)")
+    return eval(compile(tree, "<ffmpeg-expr>", "eval"), {"iw": iw, "ih": ih})
+
+
+def parse_blind_spot(spec, frame_width, frame_height):
+    """Parse an ffmpeg-style 'w:h:x:y' spec into a (x1, y1, x2, y2) pixel rect.
+
+    iw/ih in the spec refer to the supplied frame_width/frame_height.  Returns
+    pixel coordinates in that same reference frame; callers must translate to
+    bbox coordinates if they differ.
+    """
+    parts = spec.split(":")
+    if len(parts) != 4:
+        raise ValueError(f"--blind-spot must be 'w:h:x:y' (got {spec!r})")
+    w_e, h_e, x_e, y_e = parts
+    w = _eval_ffmpeg_expr(w_e, frame_width, frame_height)
+    h = _eval_ffmpeg_expr(h_e, frame_width, frame_height)
+    x = _eval_ffmpeg_expr(x_e, frame_width, frame_height)
+    y = _eval_ffmpeg_expr(y_e, frame_width, frame_height)
+    return (x, y, x + w, y + h)
+
+
+def _parse_crop_offsets(crop_spec, video_width, video_height):
+    """Parse a 'w:h:x:y' crop spec and return (crop_x, crop_y) in pixels."""
+    parts = crop_spec.split(":")
+    if len(parts) != 4:
+        raise ValueError(f"Cannot parse --crop spec for blind-spot translation: {crop_spec!r}")
+    _w_e, _h_e, x_e, y_e = parts
+    return (
+        _eval_ffmpeg_expr(x_e, video_width, video_height),
+        _eval_ffmpeg_expr(y_e, video_width, video_height),
+    )
+
+
+def _get_video_dimensions(video_path):
+    """Return (width, height) of the first video stream via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=,",
+         str(video_path)],
+        check=True, capture_output=True, text=True,
+    )
+    w, h = result.stdout.strip().split(",")
+    return int(w), int(h)
+
+
+def filter_blind_spot_bboxes(frame_lines, rect):
+    """Drop bboxes wholly contained inside rect=(x1, y1, x2, y2).
+
+    A bbox that extends outside the rect (even partially) is kept.  Returns a
+    new frame_lines list; originals are unchanged.
+    """
+    x1, y1, x2, y2 = rect
+    removed = 0
+    filtered = []
+    for lines in frame_lines:
+        kept = []
+        for entry in lines:
+            _text, bx, by, bw, bh = entry
+            if bx >= x1 and by >= y1 and bx + bw <= x2 and by + bh <= y2:
+                removed += 1
+                continue
+            kept.append(entry)
+        filtered.append(kept)
+    print(f"Blind-spot filter: removed {removed} bboxes inside rect=({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})")
+    return filtered
+
+
 def _build_watermark_charset(watermark_text):
     """Build a set of normalised characters from watermark text for fuzzy matching."""
     chars = set()
@@ -1499,7 +1565,15 @@ def main():
         metavar="TEXT",
         help="Watermark text to remove (fuzzy character-overlap matching catches OCR-garbled variants)",
     )
+    parser.add_argument(
+        "--blind-spot",
+        metavar="W:H:X:Y",
+        help="Ignore bboxes wholly contained inside this region (ffmpeg-style 'w:h:x:y' with iw/ih relative to the original video frame; not supported with --crop2)",
+    )
     args = parser.parse_args()
+
+    if args.blind_spot and args.crop2:
+        parser.error("--blind-spot is not supported with --crop2")
 
     scan_only_incompatible = []
     if args.scan_only:
@@ -1558,6 +1632,20 @@ def main():
                 ocr_texts, raw_frame_lines = detect_text_frames_screenai(frames, args.languages, num_workers=args.scan_threads, batch_size=batch_size or 64)
             elif args.scan_backend == "apple":
                 ocr_texts = detect_text_frames_apple(frames, args.languages, num_workers=args.scan_threads, **({"batch_size": batch_size} if batch_size is not None else {}))
+
+            # Filter blind-spot bboxes before watermark/clip-building.
+            # iw/ih in the spec refer to the original video frame; the rect is
+            # then translated by the --crop offset so it lines up with bbox
+            # coordinates (which are in cropped-frame space).
+            if args.blind_spot and raw_frame_lines is not None:
+                vw, vh = _get_video_dimensions(video_path)
+                rect = parse_blind_spot(args.blind_spot, vw, vh)
+                cx, cy = _parse_crop_offsets(args.crop, vw, vh)
+                rect = (rect[0] - cx, rect[1] - cy, rect[2] - cx, rect[3] - cy)
+                raw_frame_lines = filter_blind_spot_bboxes(raw_frame_lines, rect)
+                all_h = [h for lines in raw_frame_lines for _, _, _, _, h in lines if h > 0]
+                fl_min_h, fl_max_h = _compute_line_height_range(all_h)
+                ocr_texts = _build_texts_from_frame_lines(raw_frame_lines, len(frames), fl_min_h, fl_max_h)
 
             # Filter watermark bboxes before building clips
             if args.watermark and raw_frame_lines is not None:

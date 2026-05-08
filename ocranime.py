@@ -489,14 +489,32 @@ def _parse_response_lines(response_lines):
 def _compute_line_height_range(all_heights):
     """Compute allowed line height range from observed bbox heights.
 
-    Since most OCR lines are subtitles (consistent height), the median height
-    represents the subtitle size.  Returns (min_h, max_h) thresholds.
-    Returns (0, 0) if there aren't enough lines to decide.
+    Subtitle text is typically the largest persistent text on screen.  When the
+    distribution is bimodal (subtitles plus smaller UI/chat text), a plain
+    median can latch onto the wrong cluster if small text outnumbers the
+    subtitle.  To handle this, group heights into clusters separated by gaps
+    and pick the cluster with the largest representative height.  Returns
+    (min_h, max_h) thresholds.  Returns (0, 0) if undecidable.
     """
     if len(all_heights) < 2:
         return 0, 0
     sorted_h = sorted(all_heights)
-    median_h = sorted_h[len(sorted_h) // 2]
+    # Group consecutive heights into clusters.  A jump > 40% of the previous
+    # height (and at least 3px) starts a new cluster — heights within a single
+    # font size cluster tightly, but font-size differences leave a clear gap.
+    clusters = [[sorted_h[0]]]
+    for h in sorted_h[1:]:
+        last = clusters[-1][-1]
+        if h - last > max(3, last * 0.4):
+            clusters.append([])
+        clusters[-1].append(h)
+    # Drop tiny clusters (likely noise) — require at least 5% of all samples.
+    min_size = max(5, len(all_heights) * 0.05)
+    significant = [c for c in clusters if len(c) >= min_size] or clusters
+    # Subtitles are the biggest persistent text — pick the cluster whose median
+    # is largest among significant clusters.
+    chosen = max(significant, key=lambda c: c[len(c) // 2])
+    median_h = chosen[len(chosen) // 2]
     if median_h <= 0:
         return 0, 0
     return median_h * _BBOX_HEIGHT_RATIO_MIN, median_h * _BBOX_HEIGHT_RATIO_MAX
@@ -909,9 +927,9 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
                 all_heights.append(h)
     min_h, max_h = _compute_line_height_range(all_heights)
     if all_heights:
-        sorted_h = sorted(all_heights)
-        median_h = sorted_h[len(sorted_h) // 2]
-        print(f"Bbox filter: median_h={median_h:.0f} keep=[{min_h:.0f}, {max_h:.0f}] ({len(all_heights)} samples)")
+        # Recover the chosen cluster median from the keep range bounds.
+        chosen_median = min_h / _BBOX_HEIGHT_RATIO_MIN if min_h > 0 else 0
+        print(f"Bbox filter: chosen_h={chosen_median:.0f} keep=[{min_h:.0f}, {max_h:.0f}] ({len(all_heights)} samples)")
 
     texts = _build_texts_from_frame_lines(frame_lines, len(frames), min_h, max_h)
     return texts, frame_lines
